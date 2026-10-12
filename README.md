@@ -16,6 +16,36 @@ The `--pm` option accepts `npm`, `pnpm`, `yarn`, or `bun`. It overrides
 `packageManager` in `package.json` and lockfile detection. The selected package
 manager must be installed and available on `PATH`.
 
+## Install (macOS and Linux)
+
+Release binaries are built for macOS (Apple Silicon and Intel) and Linux
+(x86_64 and ARM64). Once a release has been published, Rust and Cargo are not
+required to install or run its binary. Install the latest release with:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ruum0r/depee/main/install.sh | sh
+```
+
+The installer puts `depee` in `~/.local/bin`. Set `DEPEE_INSTALL_DIR` to choose a
+different directory. Make sure the install directory is on your `PATH`.
+
+The binary still needs npm, pnpm, Yarn, or Bun on `PATH` to inspect and update a
+project. Pushing a version tag such as `v0.1.0` builds and publishes the release
+archives used by the installer.
+
+The installer checks the archive against the release's `SHA256SUMS`. This
+detects transfer errors; the checksum alone does not authenticate the publisher.
+The release workflow also attaches signed build provenance. If GitHub CLI is
+installed and authenticated, the installer verifies that provenance. You can
+also verify it manually after downloading an archive:
+
+```sh
+gh attestation verify depee-aarch64-apple-darwin.tar.gz --repo ruum0r/depee \
+  --cert-identity-regex '^https://github\.com/ruum0r/depee/\.github/workflows/release\.yml@refs/tags/v'
+```
+
+Replace the archive name with the one for your platform.
+
 ## Keys
 
 | Key | Action |
