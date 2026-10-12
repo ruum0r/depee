@@ -29,9 +29,28 @@ curl -fsSL https://raw.githubusercontent.com/ruum0r/depee/main/install.sh | sh
 The installer puts `depee` in `~/.local/bin`. Set `DEPEE_INSTALL_DIR` to choose a
 different directory. Make sure the install directory is on your `PATH`.
 
+When a newer version is available, `depee` opens with an update screen. Choose
+**Update now** to run the installer into the directory of the running `depee`
+binary, **Skip this version** to stop being asked about that release, or
+**Remind me later** (Esc) to continue to the dependency list.
+
+`depee` checks GitHub Releases in the background at most once every 24 hours.
+A newly found release is offered on the next launch, and a failed check does
+not block the app. Update checks are enabled by
+default. Disable them in `~/.config/depee/config.toml`:
+
+```toml
+check_for_updates = false
+```
+
+The same config path is used on macOS and Linux. The check only requests the
+latest release metadata from GitHub; it does not send project information.
+
 The binary still needs npm, pnpm, Yarn, or Bun on `PATH` to inspect and update a
 project. Pushing a version tag such as `v0.1.0` builds and publishes the release
-archives used by the installer.
+archives used by the installer. GitHub automatically generates release notes
+from merged pull requests, grouped by labels configured in
+`.github/release.yml`. Add the `skip-changelog` label to exclude a pull request.
 
 The installer checks the archive against the release's `SHA256SUMS`. This
 detects transfer errors; the checksum alone does not authenticate the publisher.
@@ -63,7 +82,7 @@ Replace the archive name with the one for your platform.
 | `r` | Refresh package data |
 | `e` | Show the last update error |
 | `?` | Show the key summary |
-| `q` | Quit |
+| `q`, `Ctrl+c` | Quit |
 
 The package table shows the current version, newest stable patch and minor
 versions, newest stable release, and the publication age of the latest tagged
@@ -71,7 +90,10 @@ release. Registry lookups run in the background with at most four requests at
 once.
 
 Registry details are loaded asynchronously and cached for 12 hours under the
-platform cache directory. Network failures leave the package list usable.
+platform cache directory (`~/.cache/depee` on macOS). Network failures leave the
+package list usable.
+Run `depee --clear-cache` to remove registry metadata and update-check cache;
+they will be fetched again as needed.
 Updates are run as argument arrays through the detected package manager and
 only after confirmation.
 

@@ -109,3 +109,83 @@ fn version_table_groups_patch_minor_and_major() {
         ("24.13.5".into(), "24.15.0".into(), "26.6.5".into())
     );
 }
+
+#[test]
+fn pending_update_respects_version_and_skip() {
+    let cache = |latest: &str, skipped: Option<&str>| UpdateCheckCache {
+        checked_at: Utc::now(),
+        latest_version: Some(latest.into()),
+        skipped_version: skipped.map(Into::into),
+    };
+    assert_eq!(
+        pending_update(&cache("99.0.0", None)).as_deref(),
+        Some("99.0.0")
+    );
+    assert_eq!(pending_update(&cache("99.0.0", Some("99.0.0"))), None);
+    assert_eq!(
+        pending_update(&cache("99.1.0", Some("99.0.0"))).as_deref(),
+        Some("99.1.0")
+    );
+    assert_eq!(pending_update(&cache("0.0.1", None)), None);
+}
+
+#[test]
+fn update_cache_without_skipped_version_parses() {
+    let cache: UpdateCheckCache =
+        serde_json::from_str(r#"{"checked_at":"2026-01-01T00:00:00Z","latest_version":"9.9.9"}"#)
+            .unwrap();
+    assert_eq!(cache.skipped_version, None);
+}
+
+#[test]
+fn nav_keys_are_shared() {
+    let key = |code, modifiers| KeyEvent::new(code, modifiers);
+    let none = KeyModifiers::NONE;
+    let ctrl = KeyModifiers::CONTROL;
+    assert_eq!(nav_delta(&key(KeyCode::Up, none), true), Some(-1));
+    assert_eq!(nav_delta(&key(KeyCode::Char('p'), ctrl), true), Some(-1));
+    assert_eq!(nav_delta(&key(KeyCode::Char('k'), none), true), Some(-1));
+    assert_eq!(nav_delta(&key(KeyCode::Down, none), false), Some(1));
+    assert_eq!(nav_delta(&key(KeyCode::Char('n'), ctrl), false), Some(1));
+    assert_eq!(nav_delta(&key(KeyCode::Char('j'), none), false), None);
+    assert_eq!(nav_delta(&key(KeyCode::Char('n'), none), true), None);
+    assert_eq!(step(0, -1, 3), 0);
+    assert_eq!(step(2, 1, 3), 2);
+    assert_eq!(step(0, 1, 0), 0);
+}
+
+#[test]
+fn ctrl_c_quits_instead_of_opening_changelog() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App {
+        cwd: PathBuf::from("."),
+        project: "test".into(),
+        pm: Pm::Npm,
+        pm_version: String::new(),
+        total: 0,
+        packages: vec![],
+        selected: 0,
+        query: None,
+        sort: Sort::Name,
+        descending: false,
+        loading: false,
+        updating: false,
+        confirm: false,
+        version_picker: false,
+        selected_target: None,
+        target_latest: false,
+        upgrade: false,
+        status: String::new(),
+        update_prompt: None,
+        install_update: None,
+        error: None,
+        metadata_loading: HashMap::new(),
+        metadata_requested: HashSet::new(),
+        metadata_limit: Arc::new(tokio::sync::Semaphore::new(1)),
+        tx,
+    };
+    let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+    assert!(key(&mut app, ctrl_c).unwrap());
+    app.query = Some(String::new());
+    assert!(key(&mut app, ctrl_c).unwrap());
+}

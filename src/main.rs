@@ -12,13 +12,13 @@ use chrono::{DateTime, Utc};
 use clap::{Parser, ValueEnum};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Flex, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Cell, List, ListItem, Padding, Paragraph, Row, Table, TableState},
     DefaultTerminal, Frame,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::{process::Command, sync::mpsc, time::timeout};
 
@@ -33,6 +33,8 @@ struct Cli {
     cwd: PathBuf,
     #[arg(long, value_enum)]
     pm: Option<Pm>,
+    #[arg(long)]
+    clear_cache: bool,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
@@ -115,6 +117,19 @@ struct Metadata {
     downloads: Option<u64>,
     releases: Vec<Release>,
 }
+#[derive(Serialize, Deserialize)]
+struct UpdateCheckCache {
+    checked_at: DateTime<Utc>,
+    latest_version: Option<String>,
+    #[serde(default)]
+    skipped_version: Option<String>,
+}
+struct UpdatePrompt {
+    version: String,
+    selected: usize,
+}
+const UPDATE_CHOICES: [&str; 3] = ["Update now", "Skip this version", "Remind me later"];
+const INSTALL_SCRIPT_URL: &str = "https://raw.githubusercontent.com/ruum0r/depee/main/install.sh";
 enum Msg {
     Scan(Result<Vec<Package>, String>),
     Metadata(usize, Result<Metadata, String>),
@@ -147,6 +162,8 @@ struct App {
     target_latest: bool,
     upgrade: bool,
     status: String,
+    update_prompt: Option<UpdatePrompt>,
+    install_update: Option<String>,
     error: Option<String>,
     metadata_loading: HashMap<usize, bool>,
     metadata_requested: HashSet<usize>,
@@ -298,6 +315,10 @@ impl App {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    if cli.clear_cache {
+        clear_cache()?;
+        return Ok(());
+    }
     let cwd = fs::canonicalize(&cli.cwd)
         .with_context(|| format!("Project directory not found: {}", cli.cwd.display()))?;
     let mf: Manifest = serde_json::from_slice(
@@ -334,6 +355,8 @@ async fn main() -> Result<()> {
         target_latest: false,
         upgrade: false,
         status: "Loading dependencies…".into(),
+        update_prompt: None,
+        install_update: None,
         error: None,
         metadata_loading: HashMap::new(),
         metadata_requested: HashSet::new(),
@@ -358,10 +381,26 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|| "N/A".into());
         let _ = tx_version.send(Msg::PmVersion(version));
     });
+    if update_check_enabled() {
+        app.update_prompt = read_update_cache()
+            .as_ref()
+            .and_then(pending_update)
+            .map(|version| UpdatePrompt {
+                version,
+                selected: 0,
+            });
+        tokio::spawn(async {
+            let _ = refresh_update_cache().await;
+        });
+    }
     let mut term = ratatui::init();
     let result = ui(&mut term, &mut app, &mut rx).await;
     ratatui::restore();
-    result
+    result?;
+    if let Some(version) = app.install_update {
+        install_update(&version)?;
+    }
+    Ok(())
 }
 
 fn detect(explicit: Option<Pm>, field: Option<&str>, cwd: &Path) -> Result<Pm> {
@@ -600,6 +639,35 @@ fn change(a: &str, b: Option<&str>) -> Change {
 fn clean_spec(s: &str) -> &str {
     s.trim_start_matches(['v', '^', '~', '='])
 }
+
+fn cache_dir() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        dirs::home_dir().map(|home| home.join(".cache"))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        dirs::cache_dir()
+    }
+}
+
+fn clear_cache() -> Result<()> {
+    let path = cache_dir()
+        .map(|dir| dir.join("depee"))
+        .ok_or_else(|| anyhow!("Could not determine the platform cache directory"))?;
+    match fs::remove_dir_all(&path) {
+        Ok(()) => println!("Cleared depee cache at {}", path.display()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            println!("No depee cache found at {}", path.display());
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("Could not clear cache at {}", path.display()))
+        }
+    }
+    Ok(())
+}
+
 fn rank(c: Change) -> u8 {
     match c {
         Change::Major => 4,
@@ -617,7 +685,7 @@ async fn metadata(name: &str) -> Result<Metadata> {
         .build()?;
     let safe = name.replace('/', "%2f");
     let url = format!("https://registry.npmjs.org/{}", safe);
-    let cache = dirs::cache_dir().map(|d| {
+    let cache = cache_dir().map(|d| {
         d.join("depee")
             .join(format!("{}.json", name.replace('/', "_").replace('@', "")))
     });
@@ -850,7 +918,187 @@ async fn ui(
         .context("Terminal event reader task failed")?;
     Ok(())
 }
+
+fn update_cache_path() -> Option<PathBuf> {
+    cache_dir().map(|dir| dir.join("depee/.update-check.json"))
+}
+
+fn read_update_cache() -> Option<UpdateCheckCache> {
+    let bytes = fs::read(update_cache_path()?).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn write_update_cache(cache: &UpdateCheckCache) {
+    let Some(path) = update_cache_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(bytes) = serde_json::to_vec(cache) {
+        let _ = fs::write(path, bytes);
+    }
+}
+
+fn pending_update(cache: &UpdateCheckCache) -> Option<String> {
+    cache
+        .latest_version
+        .clone()
+        .filter(|version| is_newer(version))
+        .filter(|version| cache.skipped_version.as_ref() != Some(version))
+}
+
+/// Fetches the latest release into the cache. The result is shown on the next launch.
+async fn refresh_update_cache() -> Result<()> {
+    const REPO: &str = "ruum0r/depee";
+    const CACHE_TTL_HOURS: i64 = 24;
+
+    if let Some(cache) = read_update_cache() {
+        let age = Utc::now().signed_duration_since(cache.checked_at);
+        if age.num_seconds() >= 0 && age.num_hours() < CACHE_TTL_HOURS {
+            return Ok(());
+        }
+    }
+
+    let client = reqwest::Client::builder()
+        .user_agent(concat!("depee/", env!("CARGO_PKG_VERSION")))
+        .timeout(Duration::from_secs(3))
+        .build()?;
+    let release: Value = client
+        .get(format!(
+            "https://api.github.com/repos/{REPO}/releases/latest"
+        ))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let latest_version = release
+        .get("tag_name")
+        .and_then(Value::as_str)
+        .map(|tag| tag.trim_start_matches('v').to_string())
+        .filter(|version| semver::Version::parse(version).is_ok());
+
+    // Re-read so a version skipped while the request was in flight is kept.
+    let skipped_version = read_update_cache().and_then(|cache| cache.skipped_version);
+    write_update_cache(&UpdateCheckCache {
+        checked_at: Utc::now(),
+        latest_version,
+        skipped_version,
+    });
+    Ok(())
+}
+
+fn skip_update(version: &str) {
+    if let Some(mut cache) = read_update_cache() {
+        cache.skipped_version = Some(version.to_string());
+        write_update_cache(&cache);
+    }
+}
+
+/// Replaces this process with the installer so the running binary can be overwritten.
+#[cfg(unix)]
+fn install_update(version: &str) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+
+    let exe = std::env::current_exe().context("Could not locate the depee executable")?;
+    let install_dir = exe
+        .parent()
+        .ok_or_else(|| anyhow!("Could not determine the install directory"))?;
+    println!("Updating depee to v{version}…");
+    let error = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "curl -fsSL {INSTALL_SCRIPT_URL} | sh && echo 'Restart depee to use the new version.'"
+        ))
+        .env("DEPEE_INSTALL_DIR", install_dir)
+        .exec();
+    Err(error).context("Could not run the installer")
+}
+
+#[cfg(not(unix))]
+fn install_update(_version: &str) -> Result<()> {
+    println!("Install the update with: curl -fsSL {INSTALL_SCRIPT_URL} | sh");
+    Ok(())
+}
+
+fn is_newer(version: &str) -> bool {
+    let current = semver::Version::parse(env!("CARGO_PKG_VERSION"));
+    let latest = semver::Version::parse(version);
+    matches!((current, latest), (Ok(current), Ok(latest)) if latest > current)
+}
+
+fn update_check_enabled() -> bool {
+    let Some(path) = dirs::home_dir().map(|home| home.join(".config/depee/config.toml")) else {
+        return true;
+    };
+    let Ok(contents) = fs::read_to_string(path) else {
+        return true;
+    };
+
+    contents
+        .lines()
+        .filter_map(|line| {
+            let line = line.split('#').next()?.trim();
+            let (key, value) = line.split_once('=')?;
+            (key.trim() == "check_for_updates").then(|| value.trim())
+        })
+        .last()
+        .and_then(|value| match value {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        })
+        .unwrap_or(true)
+}
+
+/// Up/down movement shared by every list: ↑/↓ and Ctrl+p/Ctrl+n, plus j/k when
+/// letters are not being typed into a text field.
+fn nav_delta(k: &KeyEvent, letters: bool) -> Option<isize> {
+    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+    match k.code {
+        KeyCode::Up => Some(-1),
+        KeyCode::Down => Some(1),
+        KeyCode::Char('p') if ctrl => Some(-1),
+        KeyCode::Char('n') if ctrl => Some(1),
+        KeyCode::Char('k') if letters && !ctrl => Some(-1),
+        KeyCode::Char('j') if letters && !ctrl => Some(1),
+        _ => None,
+    }
+}
+
+fn step(index: usize, delta: isize, len: usize) -> usize {
+    (index as isize + delta).clamp(0, len.saturating_sub(1) as isize) as usize
+}
+
 fn key(a: &mut App, k: KeyEvent) -> Result<bool> {
+    // Ctrl+c quits from every screen, before any screen-specific handling.
+    if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
+        return Ok(true);
+    }
+    if let Some(prompt) = &mut a.update_prompt {
+        if let Some(d) = nav_delta(&k, true) {
+            prompt.selected = step(prompt.selected, d, UPDATE_CHOICES.len());
+            return Ok(false);
+        }
+        match k.code {
+            KeyCode::Enter => {
+                match prompt.selected {
+                    0 => {
+                        a.install_update = Some(prompt.version.clone());
+                        return Ok(true);
+                    }
+                    1 => skip_update(&prompt.version),
+                    _ => {}
+                }
+                a.update_prompt = None;
+            }
+            KeyCode::Esc => a.update_prompt = None,
+            KeyCode::Char('q') => return Ok(true),
+            _ => {}
+        }
+        return Ok(false);
+    }
     if a.confirm {
         match k.code {
             KeyCode::Enter | KeyCode::Char('y') => a.update(),
@@ -862,28 +1110,14 @@ fn key(a: &mut App, k: KeyEvent) -> Result<bool> {
         return Ok(false);
     }
     if a.version_picker {
+        if let Some(d) = nav_delta(&k, true) {
+            if let Some(p) = a.packages.get_mut(a.selected) {
+                p.release_index = step(p.release_index, d, p.releases.len());
+            }
+            return Ok(false);
+        }
         match k.code {
             KeyCode::Esc | KeyCode::Char('v') => a.version_picker = false,
-            KeyCode::Up | KeyCode::Char('k') if !k.modifiers.contains(KeyModifiers::CONTROL) => {
-                if let Some(p) = a.packages.get_mut(a.selected) {
-                    p.release_index = p.release_index.saturating_sub(1)
-                }
-            }
-            KeyCode::Char('p') if k.modifiers.contains(KeyModifiers::CONTROL) => {
-                if let Some(p) = a.packages.get_mut(a.selected) {
-                    p.release_index = p.release_index.saturating_sub(1)
-                }
-            }
-            KeyCode::Down | KeyCode::Char('j') if !k.modifiers.contains(KeyModifiers::CONTROL) => {
-                if let Some(p) = a.packages.get_mut(a.selected) {
-                    p.release_index = (p.release_index + 1).min(p.releases.len().saturating_sub(1))
-                }
-            }
-            KeyCode::Char('n') if k.modifiers.contains(KeyModifiers::CONTROL) => {
-                if let Some(p) = a.packages.get_mut(a.selected) {
-                    p.release_index = (p.release_index + 1).min(p.releases.len().saturating_sub(1))
-                }
-            }
             KeyCode::Enter => {
                 a.selected_target = a
                     .packages
@@ -899,15 +1133,9 @@ fn key(a: &mut App, k: KeyEvent) -> Result<bool> {
         return Ok(false);
     }
     if a.query.is_some() {
-        if k.modifiers.contains(KeyModifiers::CONTROL) {
-            match k.code {
-                KeyCode::Char('n') => a.move_selection(1),
-                KeyCode::Char('p') => a.move_selection(-1),
-                _ => {}
-            }
-            if matches!(k.code, KeyCode::Char('n' | 'p')) {
-                return Ok(false);
-            }
+        if let Some(d) = nav_delta(&k, false) {
+            a.move_selection(d);
+            return Ok(false);
         }
         match k.code {
             KeyCode::Esc | KeyCode::Enter => a.query = None,
@@ -922,12 +1150,12 @@ fn key(a: &mut App, k: KeyEvent) -> Result<bool> {
         }
         return Ok(false);
     }
+    if let Some(d) = nav_delta(&k, true) {
+        a.move_selection(d);
+        return Ok(false);
+    }
     match k.code {
         KeyCode::Char('q') => return Ok(true),
-        KeyCode::Char('n') if k.modifiers.contains(KeyModifiers::CONTROL) => a.move_selection(1),
-        KeyCode::Char('p') if k.modifiers.contains(KeyModifiers::CONTROL) => a.move_selection(-1),
-        KeyCode::Down | KeyCode::Char('j') => a.move_selection(1),
-        KeyCode::Up | KeyCode::Char('k') => a.move_selection(-1),
         KeyCode::Enter => {
             a.request_metadata();
             if let Some(package) = a.packages.get(a.selected) {
@@ -1006,6 +1234,10 @@ fn draw(f: &mut Frame, a: &App) {
         );
         return;
     }
+    if let Some(prompt) = &a.update_prompt {
+        draw_update_prompt(f, prompt);
+        return;
+    }
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -1014,6 +1246,7 @@ fn draw(f: &mut Frame, a: &App) {
             Constraint::Length(3),
         ])
         .split(area);
+    let (content_area, footer_area) = (rows[1], rows[2]);
     let state = if a.updating {
         "UPDATING"
     } else if a.loading {
@@ -1040,14 +1273,14 @@ fn draw(f: &mut Frame, a: &App) {
         let panes = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
-            .split(rows[1]);
+            .split(content_area);
         draw_list(f, a, panes[0]);
         draw_details(f, a, panes[1]);
     } else {
         let panes = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
-            .split(rows[1]);
+            .split(content_area);
         draw_list(f, a, panes[0]);
         draw_details(f, a, panes[1]);
     }
@@ -1064,7 +1297,7 @@ fn draw(f: &mut Frame, a: &App) {
     } else if let Some(q) = &a.query {
         vec![
             Line::from(format!("Search: {q} · type to filter · Enter/Esc finish")),
-            Line::from("↑/↓ or j/k moves through matching packages."),
+            Line::from("↑/↓ or Ctrl+n/p moves through matching packages."),
         ]
     } else {
         vec![
@@ -1083,8 +1316,53 @@ fn draw(f: &mut Frame, a: &App) {
                     .borders(Borders::ALL)
                     .padding(Padding::horizontal(1)),
             ),
-        rows[2],
+        footer_area,
     );
+}
+fn draw_update_prompt(f: &mut Frame, prompt: &UpdatePrompt) {
+    let area = f.area();
+    f.render_widget(
+        Block::default().borders(Borders::ALL).title(" depee "),
+        area,
+    );
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "Update available",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(format!(
+            "v{} → v{}",
+            env!("CARGO_PKG_VERSION"),
+            prompt.version
+        )),
+        Line::from(""),
+    ];
+    for (i, choice) in UPDATE_CHOICES.iter().enumerate() {
+        lines.push(if i == prompt.selected {
+            Line::from(Span::styled(
+                format!("> {choice}"),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ))
+        } else {
+            Line::from(format!("  {choice}"))
+        });
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "↑/↓ or j/k select · Enter confirm · Esc later · q quit",
+        Style::default().fg(Color::DarkGray),
+    )));
+    let [body] = Layout::vertical([Constraint::Length(lines.len() as u16)])
+        .flex(Flex::Center)
+        .areas(area);
+    let [body] = Layout::horizontal([Constraint::Length(48)])
+        .flex(Flex::Center)
+        .areas(body);
+    f.render_widget(Paragraph::new(lines), body);
 }
 fn draw_list(f: &mut Frame, a: &App, area: ratatui::layout::Rect) {
     let ids = a.visible();
