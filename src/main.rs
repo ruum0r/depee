@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
@@ -77,11 +78,22 @@ struct Release {
     change: Change,
     prerelease: bool,
     dependencies: Vec<String>,
+    dependency_specs: DependencySpecs,
+    engines_node: Option<String>,
+    deprecated: Option<String>,
+    license: Option<String>,
+}
+#[derive(Clone, Debug, Default)]
+struct DependencySpecs {
+    dependencies: HashMap<String, String>,
+    peer: HashMap<String, String>,
+    optional: HashMap<String, String>,
 }
 #[derive(Clone, Debug)]
 struct Package {
     name: String,
     current: String,
+    current_spec: String,
     wanted: Option<String>,
     latest: Option<String>,
     kind: Kind,
@@ -131,9 +143,10 @@ struct UpdatePrompt {
 const UPDATE_CHOICES: [&str; 3] = ["Update now", "Skip this version", "Remind me later"];
 const INSTALL_SCRIPT_URL: &str = "https://raw.githubusercontent.com/ruum0r/depee/main/install.sh";
 enum Msg {
-    Scan(Result<Vec<Package>, String>),
+    Scan(Result<(Vec<Package>, Option<String>), String>),
     Metadata(usize, Result<Metadata, String>),
     PmVersion(String),
+    NodeVersion(String),
     Update(Result<String, String>),
 }
 type Outdated = (String, String, Option<String>, Option<String>);
@@ -148,6 +161,8 @@ struct App {
     project: String,
     pm: Pm,
     pm_version: String,
+    yarn_berry: bool,
+    node_version: String,
     total: usize,
     packages: Vec<Package>,
     selected: usize,
@@ -157,16 +172,23 @@ struct App {
     loading: bool,
     updating: bool,
     confirm: bool,
+    confirm_scroll: u16,
+    // Furthest useful scroll offset, recorded by the last confirmation draw.
+    confirm_scroll_max: std::cell::Cell<u16>,
     version_picker: bool,
     selected_target: Option<String>,
     target_latest: bool,
     upgrade: bool,
     status: String,
+    status_after_refresh: Option<String>,
     update_prompt: Option<UpdatePrompt>,
     install_update: Option<String>,
     error: Option<String>,
     metadata_loading: HashMap<usize, bool>,
     metadata_requested: HashSet<usize>,
+    metadata_errors: HashMap<usize, String>,
+    // `node_modules` lookups made while drawing; cleared whenever a scan finishes.
+    installed_versions: RefCell<HashMap<String, Option<String>>>,
     metadata_limit: Arc<tokio::sync::Semaphore>,
     tx: mpsc::UnboundedSender<Msg>,
 }
@@ -278,6 +300,38 @@ impl App {
             })
         })
     }
+    // Latest and explicitly picked versions can only be reached by an upgrade,
+    // so they override the Compatible/Upgrade toggle without changing it.
+    fn upgrading(&self) -> bool {
+        self.upgrade || self.target_latest || self.selected_target.is_some()
+    }
+    fn open_confirm(&mut self) {
+        self.confirm = true;
+        self.confirm_scroll = 0;
+    }
+    fn close_confirm(&mut self) {
+        self.confirm = false;
+        self.confirm_scroll = 0;
+        self.selected_target = None;
+    }
+    fn effective_target(&self) -> Option<String> {
+        let package = self.packages.get(self.selected)?;
+        if self.upgrading() {
+            self.target().or_else(|| Some(package.current.clone()))
+        } else {
+            package
+                .wanted
+                .clone()
+                .or_else(|| Some(package.current.clone()))
+        }
+    }
+    fn installed_version(&self, package: &str) -> Option<String> {
+        self.installed_versions
+            .borrow_mut()
+            .entry(package.to_string())
+            .or_insert_with(|| installed_version(&self.cwd, package))
+            .clone()
+    }
     fn refresh(&mut self) {
         if self.loading || self.updating {
             return;
@@ -297,17 +351,29 @@ impl App {
         let Some(p) = self.packages.get(self.selected).cloned() else {
             return;
         };
-        let target = self.target().unwrap_or_else(|| p.current.clone());
-        self.selected_target = None;
+        let requested_target = self.target().unwrap_or_else(|| p.current.clone());
+        let effective_target = self.effective_target().unwrap_or_else(|| p.current.clone());
+        let upgrade = self.upgrading();
         let cwd = self.cwd.clone();
         let pm = self.pm;
-        let upgrade = self.upgrade;
+        let yarn_berry = self.yarn_berry;
         let tx = self.tx.clone();
-        self.confirm = false;
+        self.close_confirm();
         self.updating = true;
         self.status = "Updating…".into();
         tokio::spawn(async move {
-            let _ = tx.send(Msg::Update(update(&cwd, pm, &p, &target, upgrade).await));
+            let _ = tx.send(Msg::Update(
+                update(
+                    &cwd,
+                    pm,
+                    &p,
+                    &requested_target,
+                    &effective_target,
+                    upgrade,
+                    yarn_berry,
+                )
+                .await,
+            ));
         });
     }
 }
@@ -326,6 +392,7 @@ async fn main() -> Result<()> {
     )
     .context("package.json is invalid JSON")?;
     let pm = detect(cli.pm, mf.package_manager.as_deref(), &cwd)?;
+    let mf_package_manager = mf.package_manager.clone();
     let total = mf.dependencies.as_ref().map_or(0, HashMap::len)
         + mf.dev.as_ref().map_or(0, HashMap::len)
         + mf.optional.as_ref().map_or(0, HashMap::len);
@@ -341,6 +408,8 @@ async fn main() -> Result<()> {
         project,
         pm,
         pm_version: "checking…".into(),
+        yarn_berry: pm == Pm::Yarn && detect_yarn_berry(mf_package_manager.as_deref(), &cwd),
+        node_version: "checking…".into(),
         total,
         packages: vec![],
         selected: 0,
@@ -350,16 +419,21 @@ async fn main() -> Result<()> {
         loading: true,
         updating: false,
         confirm: false,
+        confirm_scroll: 0,
+        confirm_scroll_max: std::cell::Cell::new(0),
         version_picker: false,
         selected_target: None,
         target_latest: false,
         upgrade: false,
         status: "Loading dependencies…".into(),
+        status_after_refresh: None,
         update_prompt: None,
         install_update: None,
         error: None,
         metadata_loading: HashMap::new(),
         metadata_requested: HashSet::new(),
+        metadata_errors: HashMap::new(),
+        installed_versions: RefCell::default(),
         metadata_limit: Arc::new(tokio::sync::Semaphore::new(4)),
         tx: tx.clone(),
     };
@@ -369,8 +443,10 @@ async fn main() -> Result<()> {
         ));
     });
     let tx_version = app.tx.clone();
+    let version_cwd = app.cwd.clone();
     tokio::spawn(async move {
         let version = Command::new(pm.name())
+            .current_dir(version_cwd)
             .arg("--version")
             .output()
             .await
@@ -380,6 +456,19 @@ async fn main() -> Result<()> {
             .filter(|version| !version.is_empty())
             .unwrap_or_else(|| "N/A".into());
         let _ = tx_version.send(Msg::PmVersion(version));
+    });
+    let tx_node_version = app.tx.clone();
+    tokio::spawn(async move {
+        let version = Command::new("node")
+            .arg("--version")
+            .output()
+            .await
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+            .filter(|version| !version.is_empty())
+            .unwrap_or_else(|| "N/A".into());
+        let _ = tx_node_version.send(Msg::NodeVersion(version));
     });
     if update_check_enabled() {
         app.update_prompt = read_update_cache()
@@ -401,6 +490,25 @@ async fn main() -> Result<()> {
         install_update(&version)?;
     }
     Ok(())
+}
+
+// Yarn Classic and Berry need different commands for an in-range update, so
+// guess the flavor before `yarn --version` reports back.
+fn detect_yarn_berry(package_manager: Option<&str>, cwd: &Path) -> bool {
+    if let Some(major) = package_manager
+        .and_then(|field| field.strip_prefix("yarn@"))
+        .and_then(yarn_major)
+    {
+        return major >= 2;
+    }
+    if let Ok(lock) = fs::read_to_string(cwd.join("yarn.lock")) {
+        return lock.contains("__metadata:");
+    }
+    cwd.join(".yarnrc.yml").exists()
+}
+
+fn yarn_major(version: &str) -> Option<u64> {
+    version.trim().split('.').next()?.parse().ok()
 }
 
 fn detect(explicit: Option<Pm>, field: Option<&str>, cwd: &Path) -> Result<Pm> {
@@ -444,7 +552,8 @@ fn detect(explicit: Option<Pm>, field: Option<&str>, cwd: &Path) -> Result<Pm> {
     }
 }
 
-async fn scan(cwd: &Path, pm: Pm) -> Result<Vec<Package>> {
+// Returns the outdated packages plus a non-fatal warning for the status bar.
+async fn scan(cwd: &Path, pm: Pm) -> Result<(Vec<Package>, Option<String>)> {
     let mf: Manifest = serde_json::from_slice(&fs::read(cwd.join("package.json"))?)?;
     let mut kinds = HashMap::new();
     for (kind, map) in [
@@ -456,51 +565,51 @@ async fn scan(cwd: &Path, pm: Pm) -> Result<Vec<Package>> {
             kinds.insert(n, (s, kind));
         }
     }
-    let mut cmd = Command::new(pm.name());
-    cmd.current_dir(cwd)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    match pm {
-        Pm::Npm => {
-            cmd.args(["outdated", "--json"]);
-        }
-        Pm::Pnpm => {
-            cmd.args(["outdated", "--format", "json"]);
-        }
-        Pm::Yarn | Pm::Bun => {
-            cmd.args(["outdated", "--json"]);
-        }
-    }
-    let out = timeout(Duration::from_secs(45), cmd.output())
-        .await
-        .context("Timed out checking dependencies")??;
-    if out.stdout.is_empty() && out.status.code().unwrap_or(0) > 1 {
-        return Err(anyhow!(
-            "{} outdated failed: {}",
-            pm.name(),
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    let data: Value = if pm == Pm::Yarn && !out.stdout.is_empty() {
-        Value::Array(
-            String::from_utf8_lossy(&out.stdout)
-                .lines()
-                .filter_map(|line| serde_json::from_str(line).ok())
-                .collect(),
-        )
-    } else if out.stdout.is_empty() {
-        Value::Null
+    let args: &[&str] = match pm {
+        Pm::Pnpm => &["outdated", "--format", "json"],
+        Pm::Npm | Pm::Yarn | Pm::Bun => &["outdated", "--json"],
+    };
+    // pnpm's default `wanted` field is the lockfile resolution. Ask pnpm for
+    // its compatible target separately; in this output, `latest` is the
+    // highest version that still satisfies the manifest range. This is
+    // supplementary, so a failure falls back to pnpm's own `wanted`.
+    let (data, compatible_targets) = if pm == Pm::Pnpm {
+        let (data, compatible) = tokio::join!(
+            outdated_json(cwd, pm, args),
+            outdated_json(cwd, pm, &["outdated", "--compatible", "--format", "json"]),
+        );
+        let compatible = compatible.and_then(|compatible| {
+            Ok(parse_outdated(Pm::Pnpm, &compatible)?
+                .into_iter()
+                .filter_map(|(name, _, _, target)| target.map(|target| (name, target)))
+                .collect::<HashMap<_, _>>())
+        });
+        (data?, Some(compatible))
     } else {
-        serde_json::from_slice(&out.stdout).context("Invalid outdated JSON from package manager")?
+        (outdated_json(cwd, pm, args).await?, None)
+    };
+    let warning = match &compatible_targets {
+        Some(Err(e)) => Some(format!(
+            "compatible check failed, Wanted may be stale: {e:#}"
+        )),
+        _ => None,
     };
     let mut packages = vec![];
     for (name, current, wanted, latest) in parse_outdated(pm, &data)? {
-        let Some((_, kind)) = kinds.get(&name) else {
+        let Some((current_spec, kind)) = kinds.get(&name) else {
             continue;
+        };
+        let wanted = match &compatible_targets {
+            Some(Ok(targets)) => targets
+                .get(&name)
+                .cloned()
+                .or_else(|| Some(current.clone())),
+            _ => wanted,
         };
         packages.push(Package {
             name,
             current: current.clone(),
+            current_spec: current_spec.clone(),
             wanted,
             latest: latest.clone(),
             kind: *kind,
@@ -517,7 +626,37 @@ async fn scan(cwd: &Path, pm: Pm) -> Result<Vec<Package>> {
         });
     }
     packages.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(packages)
+    Ok((packages, warning))
+}
+async fn outdated_json(cwd: &Path, pm: Pm, args: &[&str]) -> Result<Value> {
+    let command = format!("{} {}", pm.name(), args.join(" "));
+    let mut cmd = Command::new(pm.name());
+    cmd.current_dir(cwd)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let out = timeout(Duration::from_secs(45), cmd.output())
+        .await
+        .with_context(|| format!("Timed out running {command}"))??;
+    if out.stdout.is_empty() && out.status.code().unwrap_or(0) > 1 {
+        return Err(anyhow!(
+            "{command} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(if pm == Pm::Yarn && !out.stdout.is_empty() {
+        Value::Array(
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .collect(),
+        )
+    } else if out.stdout.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&out.stdout)
+            .with_context(|| format!("Invalid JSON from {command}"))?
+    })
 }
 fn parse_outdated(pm: Pm, v: &Value) -> Result<Vec<Outdated>> {
     let mut out = vec![];
@@ -733,11 +872,12 @@ async fn metadata(name: &str) -> Result<Metadata> {
                 .and_then(Value::as_str)
                 .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
                 .map(|d| d.with_timezone(&Utc));
-            let dependencies = data
-                .get("dependencies")
-                .and_then(Value::as_object)
-                .map(|m| m.keys().cloned().collect())
-                .unwrap_or_default();
+            let dependency_specs = DependencySpecs {
+                dependencies: string_map(data.get("dependencies")),
+                peer: string_map(data.get("peerDependencies")),
+                optional: string_map(data.get("optionalDependencies")),
+            };
+            let dependencies = dependency_specs.dependencies.keys().cloned().collect();
             let prerelease = semver::Version::parse(version)
                 .map(|v| !v.pre.is_empty())
                 .unwrap_or(false);
@@ -747,6 +887,23 @@ async fn metadata(name: &str) -> Result<Metadata> {
                 change: Change::Unknown,
                 prerelease,
                 dependencies,
+                dependency_specs,
+                engines_node: data
+                    .pointer("/engines/node")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                deprecated: data
+                    .get("deprecated")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                license: data
+                    .get("license")
+                    .and_then(|value| {
+                        value
+                            .as_str()
+                            .or_else(|| value.get("type").and_then(Value::as_str))
+                    })
+                    .map(str::to_string),
             }
         })
         .collect();
@@ -805,14 +962,403 @@ async fn metadata(name: &str) -> Result<Metadata> {
     })
 }
 
+fn string_map(value: Option<&Value>) -> HashMap<String, String> {
+    value
+        .and_then(Value::as_object)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|(name, spec)| {
+                    spec.as_str().map(|spec| (name.clone(), spec.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn installed_version(cwd: &Path, package: &str) -> Option<String> {
+    let parts: Vec<_> = package.split('/').collect();
+    if parts.is_empty()
+        || parts
+            .iter()
+            .any(|part| part.is_empty() || *part == "." || *part == "..")
+    {
+        return None;
+    }
+    let mut directory = Some(cwd);
+    while let Some(root) = directory {
+        let path = parts
+            .iter()
+            .fold(root.join("node_modules"), |path, part| path.join(part))
+            .join("package.json");
+        if let Ok(bytes) = fs::read(path) {
+            if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
+                if let Some(version) = value.get("version").and_then(Value::as_str) {
+                    return Some(version.to_string());
+                }
+            }
+        }
+        directory = root.parent();
+    }
+    None
+}
+
+// Translate one npm comparator set (the part between `||`) into Cargo's
+// `VersionReq` syntax. npm separates comparators with spaces, supports hyphen
+// ranges, and treats a bare version as an exact match, whereas Cargo uses
+// commas and treats a bare version as `^`. Partial versions and wildcards
+// already mean the same thing in both once an explicit operator is present.
+fn npm_comparator_set(range: &str) -> Option<String> {
+    const OPERATORS: [&str; 8] = [">=", "<=", "~>", ">", "<", "=", "~", "^"];
+    let mut tokens: Vec<String> = vec![];
+    for token in range.split_whitespace() {
+        match tokens.last_mut() {
+            // `>= 1.2.3` is valid npm syntax; glue the operator to its version.
+            Some(last) if OPERATORS.contains(&last.as_str()) => last.push_str(token),
+            _ => tokens.push(token.to_string()),
+        }
+    }
+    let mut comparators = vec![];
+    let mut index = 0;
+    while index < tokens.len() {
+        if tokens.get(index + 1).map(String::as_str) == Some("-") {
+            let upper = tokens.get(index + 2)?;
+            comparators.push(format!(">={}", npm_version(&tokens[index])));
+            comparators.push(format!("<={}", npm_version(upper)));
+            index += 3;
+            continue;
+        }
+        let token = &tokens[index];
+        let operator = OPERATORS
+            .iter()
+            .find(|operator| token.starts_with(*operator))
+            .copied()
+            .unwrap_or("");
+        let version = npm_version(&token[operator.len()..]);
+        if version.is_empty() {
+            return None;
+        }
+        let operator = match operator {
+            "~>" => "~",
+            "" => "=",
+            operator => operator,
+        };
+        comparators.push(if matches!(version, "*" | "x" | "X") {
+            "*".to_string()
+        } else {
+            format!("{operator}{version}")
+        });
+        index += 1;
+    }
+    Some(if comparators.is_empty() {
+        "*".to_string()
+    } else {
+        comparators.join(", ")
+    })
+}
+
+fn npm_version(version: &str) -> &str {
+    version.trim_start_matches('=').trim_start_matches('v')
+}
+
+fn requirement_matches(requirement: &str, version: &str) -> Option<bool> {
+    let version = semver::Version::parse(version.trim_start_matches('v')).ok()?;
+    let mut parsed_any = false;
+    let mut all_parsed = true;
+    for alternative in requirement.split("||") {
+        match npm_comparator_set(alternative).and_then(|set| semver::VersionReq::parse(&set).ok()) {
+            Some(requirement) => {
+                parsed_any = true;
+                if requirement.matches(&version) {
+                    return Some(true);
+                }
+            }
+            None => all_parsed = false,
+        }
+    }
+    if parsed_any && all_parsed {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+fn dependency_groups(specs: &DependencySpecs) -> [(&'static str, &HashMap<String, String>); 3] {
+    [
+        ("dependencies", &specs.dependencies),
+        ("peerDependencies", &specs.peer),
+        ("optionalDependencies", &specs.optional),
+    ]
+}
+
+fn push_compatibility_subsection(lines: &mut Vec<Line<'static>>, title: &str) {
+    lines.push(Line::from(Span::styled(
+        format!(" {title}"),
+        Style::default()
+            .fg(Color::Gray)
+            .add_modifier(Modifier::BOLD),
+    )));
+}
+
+// Status marks, so states never rely on color alone:
+// ✓ compatible · ! needs review · ✗ incompatible · ? unknown · - not specified
+fn inspection_lines(a: &App, p: &Package) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from("")];
+    push_detail_section(&mut lines, "VERSION COMPATIBILITY");
+    let target_version = a.effective_target();
+    let current = p
+        .releases
+        .iter()
+        .find(|release| release.version == p.current);
+    let target = target_version
+        .as_deref()
+        .and_then(|version| p.releases.iter().find(|release| release.version == version));
+
+    if a.metadata_loading
+        .get(&a.selected)
+        .copied()
+        .unwrap_or(false)
+    {
+        lines.push(Line::from(" … Loading npm Registry metadata"));
+        return lines;
+    }
+    if let Some(error) = a.metadata_errors.get(&a.selected) {
+        lines.push(Line::from(Span::styled(
+            format!(" ✗ Failed to load npm Registry metadata · {error}"),
+            Style::default().fg(Color::Red),
+        )));
+        lines.push(Line::from(
+            " Press r to retry. Compatibility is not checked.",
+        ));
+        return lines;
+    }
+    if let Some(release) = target {
+        push_compatibility_subsection(&mut lines, "Node.js compatibility");
+        match release.engines_node.as_deref() {
+            Some(range) => match requirement_matches(range, &a.node_version) {
+                Some(true) => lines.push(Line::from(Span::styled(
+                    format!(" ✓ Node.js {} satisfies {}", a.node_version, range),
+                    Style::default().fg(Color::Green),
+                ))),
+                Some(false) => lines.push(Line::from(Span::styled(
+                    format!(" ✗ Requires Node.js {range} (current {})", a.node_version),
+                    Style::default().fg(Color::Red),
+                ))),
+                None => lines.push(Line::from(Span::styled(
+                    format!(
+                        " ? Cannot check Node.js requirement {range} (current {})",
+                        a.node_version
+                    ),
+                    Style::default().fg(Color::Gray),
+                ))),
+            },
+            None => lines.push(Line::from(" - Node.js requirement not specified")),
+        }
+
+        let mut peer_names: Vec<_> = release.dependency_specs.peer.keys().collect();
+        peer_names.sort();
+        push_compatibility_subsection(&mut lines, "Peer dependencies");
+        if peer_names.is_empty() {
+            lines.push(Line::from(" - No peer dependencies"));
+        } else {
+            let rows: Vec<_> = peer_names
+                .iter()
+                .take(5)
+                .map(|name| {
+                    let range = &release.dependency_specs.peer[*name];
+                    match a.installed_version(name) {
+                        Some(version) => match requirement_matches(range, &version) {
+                            Some(true) => (
+                                "✓ satisfies".to_string(),
+                                (*name).to_string(),
+                                range.clone(),
+                                version,
+                                Color::Green,
+                            ),
+                            Some(false) => (
+                                "✗ requires".to_string(),
+                                (*name).to_string(),
+                                range.clone(),
+                                version,
+                                Color::Red,
+                            ),
+                            None => (
+                                "? cannot check".to_string(),
+                                (*name).to_string(),
+                                range.clone(),
+                                version,
+                                Color::Gray,
+                            ),
+                        },
+                        None => (
+                            "? unresolved".to_string(),
+                            (*name).to_string(),
+                            range.clone(),
+                            "N/A".to_string(),
+                            Color::Gray,
+                        ),
+                    }
+                })
+                .collect();
+            // Pad by display width, not bytes, so `✓` lines up with ASCII marks.
+            let column_width =
+                |header: &str, cell: fn(&(String, String, String, String, Color)) -> &String| {
+                    rows.iter()
+                        .map(|row| Span::raw(cell(row).as_str()).width())
+                        .chain([header.len()])
+                        .max()
+                        .unwrap_or(0)
+                };
+            let result_width = column_width("Result", |row| &row.0);
+            let name_width = column_width("Package", |row| &row.1);
+            let range_width = column_width("Required", |row| &row.2);
+            let pad = |text: &str, width: usize| {
+                format!(
+                    "{text}{}",
+                    " ".repeat(width.saturating_sub(Span::raw(text).width()))
+                )
+            };
+            lines.push(Line::from(format!(
+                " {}  {}  {}  Current",
+                pad("Result", result_width),
+                pad("Package", name_width),
+                pad("Required", range_width),
+            )));
+            for (result, name, range, version, color) in &rows {
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        " {}  {}  {}  {version}",
+                        pad(result, result_width),
+                        pad(name, name_width),
+                        pad(range, range_width),
+                    ),
+                    Style::default().fg(*color),
+                )));
+            }
+            if release.dependency_specs.peer.len() > 5 {
+                lines.push(Line::from(format!(
+                    " … and {} more peer dependencies",
+                    release.dependency_specs.peer.len() - 5
+                )));
+            }
+        }
+        push_compatibility_subsection(&mut lines, "Deprecation");
+        if let Some(message) = release.deprecated.as_deref() {
+            lines.push(Line::from(Span::styled(
+                format!(" ! Deprecated · {message}"),
+                Style::default().fg(Color::Yellow),
+            )));
+        } else {
+            lines.push(Line::from(Span::styled(
+                " ✓ Not deprecated",
+                Style::default().fg(Color::Green),
+            )));
+        }
+        push_compatibility_subsection(&mut lines, "License");
+        match (
+            current.and_then(|release| release.license.as_deref()),
+            release.license.as_deref(),
+        ) {
+            (Some(old), Some(new)) if old == new => lines.push(Line::from(Span::styled(
+                format!(" ✓ {new} (unchanged)"),
+                Style::default().fg(Color::Green),
+            ))),
+            (Some(old), Some(new)) => lines.push(Line::from(Span::styled(
+                format!(" ! {old} → {new} (changed)"),
+                Style::default().fg(Color::Yellow),
+            ))),
+            (None, Some(new)) => lines.push(Line::from(Span::styled(
+                format!(" ? unknown → {new} (current unknown)"),
+                Style::default().fg(Color::Gray),
+            ))),
+            (Some(old), None) => lines.push(Line::from(Span::styled(
+                format!(" ? {old} → unknown (target unknown)"),
+                Style::default().fg(Color::Gray),
+            ))),
+            (None, None) => lines.push(Line::from(Span::styled(
+                " ? License information unavailable",
+                Style::default().fg(Color::Gray),
+            ))),
+        }
+
+        lines.push(Line::from(""));
+        push_compatibility_subsection(
+            &mut lines,
+            &format!("Dependency changes · {} → {}", p.current, release.version),
+        );
+        if let Some(current) = current {
+            let changes = dependency_diff(current, release);
+            if changes.is_empty() {
+                lines.push(Line::from(" - No declared dependency changes"));
+            } else {
+                for (kind, name, old, new) in &changes {
+                    match (old, new) {
+                        (None, Some(spec)) => lines.push(Line::from(Span::styled(
+                            format!(" + {name} {spec} [{kind}]"),
+                            Style::default().fg(Color::Green),
+                        ))),
+                        (Some(spec), None) => lines.push(Line::from(Span::styled(
+                            format!(" - {name} {spec} [{kind}]"),
+                            Style::default().fg(Color::Red),
+                        ))),
+                        (Some(old), Some(new)) => {
+                            lines.push(Line::from(Span::styled(
+                                format!(" - {name} {old} [{kind}]"),
+                                Style::default().fg(Color::Red),
+                            )));
+                            lines.push(Line::from(Span::styled(
+                                format!(" + {name} {new} [{kind}]"),
+                                Style::default().fg(Color::Green),
+                            )));
+                        }
+                        (None, None) => {}
+                    }
+                }
+            }
+        } else {
+            lines.push(Line::from(" ? Current version metadata unavailable"));
+        }
+    } else {
+        lines.push(Line::from(" ? Target version metadata unavailable"));
+    }
+    lines
+}
+
+fn dependency_diff(
+    current: &Release,
+    target: &Release,
+) -> Vec<(String, String, Option<String>, Option<String>)> {
+    let mut changes = Vec::new();
+    for ((kind, old_group), (_, new_group)) in dependency_groups(&current.dependency_specs)
+        .into_iter()
+        .zip(dependency_groups(&target.dependency_specs))
+    {
+        let mut names: HashSet<&String> = old_group.keys().collect();
+        names.extend(new_group.keys());
+        let mut names: Vec<_> = names.into_iter().collect();
+        names.sort();
+        for name in names {
+            let old = old_group.get(name).cloned();
+            let new = new_group.get(name).cloned();
+            if old != new {
+                changes.push((kind.to_string(), name.clone(), old, new));
+            }
+        }
+    }
+    changes
+}
+
 async fn update(
     cwd: &Path,
     pm: Pm,
     p: &Package,
-    target: &str,
+    requested_target: &str,
+    effective_target: &str,
     upgrade: bool,
+    yarn_berry: bool,
 ) -> Result<String, String> {
-    let args = update_args(pm, p, target, upgrade);
+    let args = update_args(pm, p, requested_target, upgrade, yarn_berry);
+    let command = format!("{} {}", pm.name(), args.join(" "));
     let mut cmd = Command::new(pm.name());
     cmd.current_dir(cwd)
         .stdout(Stdio::piped())
@@ -823,7 +1369,27 @@ async fn update(
         .map_err(|_| "Update timed out".to_string())?
         .map_err(|e| e.to_string())?;
     if out.status.success() {
-        Ok(format!("Updated {} to {}", p.name, target))
+        match installed_version(cwd, &p.name) {
+            Some(installed) if upgrade && installed == requested_target => Ok(format!(
+                "{command} succeeded · installed {}@{} · requested target reached",
+                p.name, installed
+            )),
+            Some(installed) if upgrade => Ok(format!(
+                "{command} succeeded · installed {}@{} · requested target {} not reached",
+                p.name, installed, requested_target
+            )),
+            Some(installed) if installed == effective_target => Ok(format!(
+                "{command} succeeded · installed {}@{} · Compatible Update used Wanted {}",
+                p.name, installed, effective_target
+            )),
+            Some(installed) => Ok(format!(
+                "{command} succeeded · installed {}@{} · Wanted target was {}",
+                p.name, installed, effective_target
+            )),
+            None => Ok(format!(
+                "{command} succeeded · installed version could not be read from node_modules"
+            )),
+        }
     } else {
         let e = String::from_utf8_lossy(&out.stderr).trim().to_string();
         Err(if e.is_empty() {
@@ -834,7 +1400,14 @@ async fn update(
     }
 }
 
-fn update_args(pm: Pm, p: &Package, target: &str, upgrade: bool) -> Vec<String> {
+// `pnpm update` and `bun update` stay in range but rewrite the manifest range
+// to start at the installed version (`^2.0.0` → `^2.1.3`). npm and the Yarn
+// commands from `update_args` leave package.json untouched.
+fn compatible_update_rewrites_range(pm: Pm) -> bool {
+    matches!(pm, Pm::Pnpm | Pm::Bun)
+}
+
+fn update_args(pm: Pm, p: &Package, target: &str, upgrade: bool, yarn_berry: bool) -> Vec<String> {
     let selector = if upgrade {
         format!("{}@{}", p.name, target)
     } else {
@@ -844,7 +1417,12 @@ fn update_args(pm: Pm, p: &Package, target: &str, upgrade: bool) -> Vec<String> 
         (Pm::Npm, false, _) | (Pm::Pnpm, false, _) | (Pm::Bun, false, _) => {
             vec!["update".into(), p.name.clone()]
         }
-        (Pm::Yarn, false, _) => vec!["up".into(), p.name.clone()],
+        // Berry's `yarn up <name>` jumps to latest; pinning the existing range
+        // keeps it in range and leaves package.json as is. Classic has no `up`.
+        (Pm::Yarn, false, _) if yarn_berry => {
+            vec!["up".into(), format!("{}@{}", p.name, p.current_spec)]
+        }
+        (Pm::Yarn, false, _) => vec!["upgrade".into(), p.name.clone()],
         (Pm::Npm, true, Kind::Dev) => vec!["install".into(), "--save-dev".into(), selector],
         (Pm::Npm, true, Kind::Optional) => {
             vec!["install".into(), "--save-optional".into(), selector]
@@ -889,10 +1467,35 @@ async fn ui(
         term.draw(|f| draw(f, app))?;
         tokio::select! {
             Some(msg)=rx.recv()=>match msg{
-                Msg::Scan(r)=>{app.loading=false;match r{Ok(p)=>{app.packages=p;app.metadata_loading.clear();app.metadata_requested.clear();app.error=None;app.status=format!("{} outdated",app.packages.len());if !app.packages.is_empty(){app.selected=app.selected.min(app.packages.len()-1);for index in 0..app.packages.len(){app.request_metadata_for(index);}}},Err(e)=>{app.status=e.clone();app.error=Some(e)}}},
+                Msg::Scan(r)=>{
+                    app.loading=false;
+                    match r {
+                        Ok((p,warning))=>{
+                            app.packages=p;
+                            app.metadata_loading.clear();
+                            app.metadata_requested.clear();
+                            app.metadata_errors.clear();
+                            app.installed_versions.borrow_mut().clear();
+                            app.status=app.status_after_refresh.take().unwrap_or_else(|| format!("{} outdated",app.packages.len()));
+                            if warning.is_some(){app.status.push_str(" · warning: press e for details");}
+                            app.error=warning;
+                            if !app.packages.is_empty(){app.selected=app.selected.min(app.packages.len()-1);for index in 0..app.packages.len(){app.request_metadata_for(index);}}
+                        },
+                        Err(e)=>{app.status_after_refresh=None;app.status=e.clone();app.error=Some(e)}
+                    }
+                },
                 Msg::Metadata(i,r)=>{
                     let selected_name=app.packages.get(app.selected).map(|p|p.name.clone());
                     app.metadata_loading.insert(i,false);
+                    let r=match r{
+                        Ok(m)=>{app.metadata_errors.remove(&i);Ok(m)},
+                        Err(e)=>{
+                            // Allow a retry; a failed fetch must not look like "no data".
+                            app.metadata_requested.remove(&i);
+                            app.metadata_errors.insert(i,e.clone());
+                            Err(e)
+                        }
+                    };
                     if let(Some(p),Ok(m))=(app.packages.get_mut(i),r){
                         p.description=m.description;
                         p.license=m.license;
@@ -906,8 +1509,14 @@ async fn ui(
                     }
                     app.preserve_selection(selected_name);
                 },
-                Msg::PmVersion(version)=>app.pm_version=version,
-                Msg::Update(r)=>{app.updating=false;match r{Ok(s)=>{app.status=s;app.error=None;app.refresh()},Err(e)=>{app.status="Update failed · press e for error".into();app.error=Some(e)}}}
+                Msg::PmVersion(version)=>{
+                    if app.pm==Pm::Yarn{
+                        if let Some(berry)=yarn_major(&version).map(|major|major>=2){app.yarn_berry=berry;}
+                    }
+                    app.pm_version=version;
+                },
+                Msg::NodeVersion(version)=>app.node_version=version,
+                Msg::Update(r)=>{app.updating=false;match r{Ok(s)=>{app.status_after_refresh=Some(s);app.error=None;app.refresh()},Err(e)=>{app.status="Update failed · press e for error".into();app.error=Some(e)}}}
             },
             Some(event)=event_rx.recv()=>if let Event::Key(k)=event{if key(app,k)?{break}}
         }
@@ -1100,11 +1709,32 @@ fn key(a: &mut App, k: KeyEvent) -> Result<bool> {
         return Ok(false);
     }
     if a.confirm {
+        if let Some(d) = nav_delta(&k, true) {
+            a.confirm_scroll = if d < 0 {
+                a.confirm_scroll.saturating_sub(1)
+            } else {
+                a.confirm_scroll
+                    .saturating_add(1)
+                    .min(a.confirm_scroll_max.get())
+            };
+            return Ok(false);
+        }
+        // Letter shortcuts must not fire for Ctrl chords (Ctrl+n is not `n`).
+        if k.modifiers.contains(KeyModifiers::CONTROL) {
+            return Ok(false);
+        }
         match k.code {
             KeyCode::Enter | KeyCode::Char('y') => a.update(),
-            KeyCode::Char('m') => a.upgrade = !a.upgrade,
-            KeyCode::Char('l') => a.target_latest = !a.target_latest,
-            KeyCode::Esc | KeyCode::Char('n') => a.confirm = false,
+            KeyCode::Char('m') if !a.target_latest && a.selected_target.is_none() => {
+                a.upgrade = !a.upgrade;
+            }
+            KeyCode::Char('l') if a.selected_target.is_none() => {
+                a.target_latest = !a.target_latest;
+            }
+            KeyCode::Char('r') if a.metadata_errors.contains_key(&a.selected) => {
+                a.request_metadata();
+            }
+            KeyCode::Esc | KeyCode::Char('n') => a.close_confirm(),
             _ => {}
         }
         return Ok(false);
@@ -1125,8 +1755,7 @@ fn key(a: &mut App, k: KeyEvent) -> Result<bool> {
                     .and_then(|p| p.releases.get(p.release_index))
                     .map(|r| r.version.clone());
                 a.version_picker = false;
-                a.upgrade = true;
-                a.confirm = true
+                a.open_confirm();
             }
             _ => {}
         }
@@ -1178,7 +1807,7 @@ fn key(a: &mut App, k: KeyEvent) -> Result<bool> {
             a.preserve_selection(selected_name);
         }
         KeyCode::Char('r') => a.refresh(),
-        KeyCode::Char('u') => a.confirm = true,
+        KeyCode::Char('u') => a.open_confirm(),
         KeyCode::Char('v') => {
             a.selected_target = None;
             a.version_picker = true;
@@ -1243,7 +1872,8 @@ fn draw(f: &mut Frame, a: &App) {
         .constraints([
             Constraint::Length(3),
             Constraint::Min(5),
-            Constraint::Length(3),
+            // Two hint lines plus borders; the second line carries the status.
+            Constraint::Length(4),
         ])
         .split(area);
     let (content_area, footer_area) = (rows[1], rows[2]);
@@ -1269,7 +1899,9 @@ fn draw(f: &mut Frame, a: &App) {
         .block(Block::default().borders(Borders::ALL)),
         rows[0],
     );
-    if area.width >= 120 {
+    if a.confirm {
+        draw_details(f, a, content_area);
+    } else if area.width >= 120 {
         let panes = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
@@ -1285,9 +1917,23 @@ fn draw(f: &mut Frame, a: &App) {
         draw_details(f, a, panes[1]);
     }
     let hints = if a.confirm {
+        let controls = if a.selected_target.is_some() {
+            "Enter confirm · explicit version uses Upgrade · Esc cancel"
+        } else if a.target_latest {
+            "Enter confirm · Latest uses Upgrade (m locked) · l Wanted · Esc cancel"
+        } else {
+            "Enter confirm · l Wanted/Latest · m Compatible/Upgrade · Esc cancel"
+        };
         vec![
-            Line::from("Enter confirm · l Wanted/Latest · m Compatible/Upgrade · Esc cancel"),
-            Line::from("Review the package, target version, package manager, and command above."),
+            Line::from(controls),
+            Line::from(format!(
+                "↑/↓ or j/k scroll confirmation{}",
+                if a.metadata_errors.contains_key(&a.selected) {
+                    " · r retry metadata"
+                } else {
+                    ""
+                }
+            )),
         ]
     } else if a.version_picker {
         vec![
@@ -1556,7 +2202,9 @@ fn draw_details(f: &mut Frame, a: &App, area: ratatui::layout::Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .padding(Padding::horizontal(1))
-        .title(if a.version_picker {
+        .title(if a.confirm {
+            " UPDATE CONFIRMATION "
+        } else if a.version_picker {
             " SELECT TARGET VERSION "
         } else {
             " PACKAGE DETAILS "
@@ -1574,52 +2222,157 @@ fn draw_details(f: &mut Frame, a: &App, area: ratatui::layout::Rect) {
         return;
     };
     if a.confirm {
+        let inner = block.inner(area);
+        let details_width = inner.width.max(1) as usize;
+        let target = a.target().unwrap_or_else(|| p.current.clone());
+        let effective_target = a.effective_target().unwrap_or_else(|| p.current.clone());
+        let target_source = if a.selected_target.is_some() {
+            "Selected version"
+        } else if a.target_latest {
+            "Latest"
+        } else {
+            "Wanted"
+        };
+        let command = format!(
+            "{} {}",
+            a.pm.name(),
+            update_args(a.pm, p, &target, a.upgrading(), a.yarn_berry).join(" ")
+        );
+        let package_json_change = if a.upgrading() {
+            format!("{} → updated for {target}", p.current_spec)
+        } else if compatible_update_rewrites_range(a.pm) {
+            format!(
+                "{} → lower bound raised to {effective_target} (still in range)",
+                p.current_spec
+            )
+        } else {
+            format!("{} (unchanged)", p.current_spec)
+        };
+        let mut lines = vec![Line::from(Span::styled(
+            format!("Update {}?", p.name),
+            Style::default().add_modifier(Modifier::BOLD),
+        ))];
+        lines.push(Line::from(""));
+        push_detail_section(&mut lines, "UPDATE IMPACT");
+        lines.push(Line::from(Span::styled(
+            format!(
+                " {} → {}   {}",
+                p.current,
+                effective_target,
+                label(change(&p.current, Some(&effective_target)))
+            ),
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+        push_detail_field(
+            &mut lines,
+            "Selected target",
+            &format!("{target_source} · {target}"),
+            details_width,
+        );
+        push_detail_field(
+            &mut lines,
+            "Effective update",
+            if a.upgrading() {
+                "Selected target is passed to command"
+            } else {
+                "Wanted · within existing range"
+            },
+            details_width,
+        );
+        push_detail_field(
+            &mut lines,
+            "Mode",
+            if a.upgrading() {
+                "Upgrade"
+            } else {
+                "Compatible Update"
+            },
+            details_width,
+        );
+        push_detail_field(
+            &mut lines,
+            "package.json",
+            &package_json_change,
+            details_width,
+        );
+        lines.push(Line::from(""));
+        push_detail_section(&mut lines, "VERSION");
+        push_detail_field(&mut lines, "Current", &p.current, details_width);
+        push_detail_field(
+            &mut lines,
+            "Wanted",
+            p.wanted.as_deref().unwrap_or("N/A"),
+            details_width,
+        );
+        push_detail_field(
+            &mut lines,
+            "Latest",
+            p.latest.as_deref().unwrap_or("N/A"),
+            details_width,
+        );
+        push_detail_field(&mut lines, "Target", &effective_target, details_width);
+        push_detail_field(
+            &mut lines,
+            "Change",
+            label(change(&p.current, Some(&effective_target))),
+            details_width,
+        );
+        push_detail_field(&mut lines, "Latest change", label(p.change), details_width);
+        lines.push(Line::from(""));
+        push_detail_section(&mut lines, "PUBLICATION");
+        push_detail_field(
+            &mut lines,
+            "Current published",
+            &p.current_published.map(ago).unwrap_or_else(|| "N/A".into()),
+            details_width,
+        );
+        push_detail_field(
+            &mut lines,
+            "Latest published",
+            &p.published.map(ago).unwrap_or_else(|| "N/A".into()),
+            details_width,
+        );
+        lines.push(Line::from(""));
+        push_detail_section(&mut lines, "PACKAGE");
+        push_detail_field(
+            &mut lines,
+            "Downloads",
+            &format!(
+                "{} / week",
+                p.downloads.map(count).unwrap_or_else(|| "N/A".into())
+            ),
+            details_width,
+        );
+        push_detail_field(
+            &mut lines,
+            "License",
+            p.license.as_deref().unwrap_or("N/A"),
+            details_width,
+        );
+        push_detail_field(
+            &mut lines,
+            "Repository",
+            p.repo.as_deref().unwrap_or("N/A"),
+            details_width,
+        );
+        push_detail_field(
+            &mut lines,
+            "Homepage",
+            p.homepage.as_deref().unwrap_or("N/A"),
+            details_width,
+        );
+        lines.push(Line::from(""));
+        push_detail_section(&mut lines, "UPDATE");
+        push_detail_field(&mut lines, "Package manager", a.pm.name(), details_width);
+        push_detail_field(&mut lines, "Command", &command, details_width);
+        lines.extend(inspection_lines(a, p));
+        let scroll_max =
+            u16::try_from(lines.len().saturating_sub(inner.height as usize)).unwrap_or(u16::MAX);
+        a.confirm_scroll_max.set(scroll_max);
         f.render_widget(
-            Paragraph::new(vec![
-                Line::from("Update package?"),
-                Line::from(""),
-                Line::from(format!("Package: {}", p.name)),
-                Line::from(format!("Current: {}", p.current)),
-                Line::from(format!(
-                    "Target: {}",
-                    a.target().unwrap_or_else(|| "N/A".into())
-                )),
-                Line::from(format!(
-                    "Change: {}",
-                    label(change(&p.current, a.target().as_deref()))
-                )),
-                Line::from(format!("Package manager: {}", a.pm.name())),
-                Line::from(format!(
-                    "Target source: {}",
-                    if a.selected_target.is_some() {
-                        "Selected version"
-                    } else if a.target_latest {
-                        "Latest"
-                    } else {
-                        "Wanted"
-                    }
-                )),
-                Line::from(format!(
-                    "Command: {} {}",
-                    a.pm.name(),
-                    update_args(
-                        a.pm,
-                        p,
-                        &a.target().unwrap_or_else(|| p.current.clone()),
-                        a.upgrade
-                    )
-                    .join(" ")
-                )),
-                Line::from(format!(
-                    "Mode: {}",
-                    if a.upgrade {
-                        "Upgrade"
-                    } else {
-                        "Compatible Update"
-                    }
-                )),
-            ])
-            .block(block),
+            Paragraph::new(lines)
+                .scroll((a.confirm_scroll.min(scroll_max), 0))
+                .block(block),
             area,
         );
         return;
