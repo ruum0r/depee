@@ -149,6 +149,13 @@ after the change and `diff -r`. Remove the temporary harness afterwards. The
   NDJSON with a `table` row, and pnpm's `wanted` is the lockfile resolution, so
   `scan` runs `pnpm outdated --compatible` separately. `outdated` exits with
   code 1 when something is outdated; that is not an error.
+- **Yarn Berry outdated:** Berry has no `outdated` command; it prints a
+  colored `Usage Error: Couldn't find a script named "outdated"` to stdout and
+  exits 1. `pm::yarn_output::parse_ndjson` turns that (and any failing Yarn
+  output with no JSON line) into an error with ANSI codes stripped, so it never
+  shows as an empty list. Detection is from the output, not
+  `ProjectInfo::yarn_berry`: the flavor is a guess, and a Berry project may
+  provide `outdated` through a plugin or script.
 - **Workspaces:** `project::find_workspace_root` walks up from `cwd` (stopping
   after the first `.git`) to the nearest `pnpm-workspace.yaml` or `workspaces`
   declaration. `ProjectInfo::load` detects the package manager there (the

@@ -2,6 +2,7 @@
 
 mod outdated;
 mod update;
+mod yarn_output;
 
 use std::{fs, path::Path};
 
