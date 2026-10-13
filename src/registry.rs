@@ -39,28 +39,64 @@ pub async fn fetch_metadata(name: &str) -> Result<Metadata> {
     let client = client()?;
     let encoded = name.replace('/', "%2f");
     let path = cache_path(name);
-    let cached = path
-        .as_deref()
-        .and_then(|path| read_cached(path, Utc::now()));
-    let mut metadata = match cached {
-        Some(metadata) => metadata,
-        None => {
-            let doc: Value = client
-                .get(format!("https://registry.npmjs.org/{encoded}"))
-                .send()
-                .await?
-                .error_for_status()?
-                .json()
-                .await?;
-            let metadata = parse_document(&doc, None);
-            if let Some(path) = &path {
-                write_cache(path, &metadata, Utc::now())?;
+    let now = Utc::now();
+    let cached = path.as_deref().and_then(|path| read_cached(path, now));
+    match plan(cached) {
+        Plan::Cached(metadata) => Ok(metadata),
+        Plan::Downloads(entry) => {
+            let downloads = fetch_downloads(client, &encoded).await;
+            let metadata = Metadata {
+                downloads,
+                ..entry.metadata
+            };
+            // Keep the original fetch time so the entry still expires on schedule.
+            if let (Some(_), Some(path)) = (downloads, &path) {
+                write_cache(path, &metadata, entry.fetched_at)?;
             }
-            metadata
+            Ok(metadata)
         }
-    };
-    metadata.downloads = fetch_downloads(client, &encoded).await;
-    Ok(metadata)
+        Plan::Everything => {
+            let (doc, downloads) = tokio::join!(
+                fetch_document(client, &encoded),
+                fetch_downloads(client, &encoded)
+            );
+            let metadata = parse_document(&doc?, downloads);
+            if let Some(path) = &path {
+                write_cache(path, &metadata, now)?;
+            }
+            Ok(metadata)
+        }
+    }
+}
+
+/// What `fetch_metadata` still has to request, given the fresh cache entry.
+#[derive(Debug)]
+enum Plan {
+    /// Everything is cached; no request at all.
+    Cached(Metadata),
+    /// The document is cached but the download count is unknown (its last
+    /// lookup failed), so only the count is retried.
+    Downloads(CacheEntry<Metadata>),
+    /// No fresh entry: the document and the download count.
+    Everything,
+}
+
+fn plan(cached: Option<CacheEntry<Metadata>>) -> Plan {
+    match cached {
+        None => Plan::Everything,
+        Some(entry) if entry.metadata.downloads.is_none() => Plan::Downloads(entry),
+        Some(entry) => Plan::Cached(entry.metadata),
+    }
+}
+
+async fn fetch_document(client: &reqwest::Client, encoded: &str) -> Result<Value> {
+    Ok(client
+        .get(format!("https://registry.npmjs.org/{encoded}"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?)
 }
 
 /// Download counts are a nice-to-have; failures leave them unknown.
@@ -87,36 +123,33 @@ fn cache_path(name: &str) -> Option<PathBuf> {
 /// Bump when the cached `Metadata` changes meaning, so older entries are
 /// refetched. Files from before versioning (raw registry documents stored as
 /// `[document, fetched_at]`) fail to deserialize and are refetched too.
-const CACHE_FORMAT: u32 = 1;
+/// Format 2 stores the weekly download count (`None` when its lookup failed).
+const CACHE_FORMAT: u32 = 2;
 
-/// On-disk cache entry: parsed metadata without download counts.
-#[derive(Serialize, Deserialize)]
+/// On-disk cache entry: parsed metadata, including the download count.
+#[derive(Debug, Serialize, Deserialize)]
 struct CacheEntry<M> {
     format: u32,
     fetched_at: DateTime<Utc>,
     metadata: M,
 }
 
-/// Fresh metadata at `path`, or `None` when the entry is missing, unreadable,
-/// from another format, or older than the TTL.
-fn read_cached(path: &Path, now: DateTime<Utc>) -> Option<Metadata> {
+/// The fresh entry at `path`, or `None` when it is missing, unreadable, from
+/// another format, or older than the TTL.
+fn read_cached(path: &Path, now: DateTime<Utc>) -> Option<CacheEntry<Metadata>> {
     let bytes = fs::read(path).ok()?;
     let entry = serde_json::from_slice::<CacheEntry<Metadata>>(&bytes).ok()?;
     let fresh = entry.format == CACHE_FORMAT
         && now.signed_duration_since(entry.fetched_at).num_hours() < CACHE_TTL_HOURS;
-    // Download counts are never served from this cache.
-    fresh.then_some(Metadata {
-        downloads: None,
-        ..entry.metadata
-    })
+    fresh.then_some(entry)
 }
 
 /// The cache is best effort; only serialization failures are reported.
-/// Callers pass metadata parsed without download counts.
-fn write_cache(path: &Path, metadata: &Metadata, now: DateTime<Utc>) -> Result<()> {
+/// `fetched_at` is when the document was fetched; the TTL counts from it.
+fn write_cache(path: &Path, metadata: &Metadata, fetched_at: DateTime<Utc>) -> Result<()> {
     let entry = CacheEntry {
         format: CACHE_FORMAT,
-        fetched_at: now,
+        fetched_at,
         metadata,
     };
     let bytes = serde_json::to_vec(&entry)?;
@@ -289,16 +322,18 @@ mod tests {
     }
 
     #[test]
-    fn cache_round_trips_metadata_without_downloads() {
+    fn cache_round_trips_metadata_with_downloads() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nested").join("lib.json");
         let now = Utc::now();
         write_cache(&path, &parse_document(&sample_document(), Some(42)), now).unwrap();
 
-        let metadata = read_cached(&path, now).unwrap();
+        let entry = read_cached(&path, now).unwrap();
+        assert_eq!(entry.fetched_at, now);
+        let metadata = entry.metadata;
         assert_eq!(metadata.description.as_deref(), Some("A lib"));
         assert_eq!(metadata.license.as_deref(), Some("MIT"));
-        assert_eq!(metadata.downloads, None);
+        assert_eq!(metadata.downloads, Some(42));
         assert_eq!(
             metadata.published.map(|d| d.to_rfc3339()).as_deref(),
             Some("2025-01-01T00:00:00+00:00")
@@ -311,6 +346,64 @@ mod tests {
         assert_eq!(latest.dependency_specs.peer["react"], "^19.0.0");
         assert_eq!(latest.engines_node.as_deref(), Some(">=18"));
         assert_eq!(metadata.releases[1].license.as_deref(), Some("ISC"));
+    }
+
+    fn entry(downloads: Option<u64>) -> CacheEntry<Metadata> {
+        CacheEntry {
+            format: CACHE_FORMAT,
+            fetched_at: Utc::now(),
+            metadata: parse_document(&sample_document(), downloads),
+        }
+    }
+
+    #[test]
+    fn plan_fetches_everything_without_a_fresh_entry() {
+        assert!(matches!(plan(None), Plan::Everything));
+    }
+
+    #[test]
+    fn plan_fetches_nothing_when_downloads_are_cached() {
+        let Plan::Cached(metadata) = plan(Some(entry(Some(42)))) else {
+            panic!("expected a cache hit");
+        };
+        assert_eq!(metadata.downloads, Some(42));
+        assert_eq!(metadata.description.as_deref(), Some("A lib"));
+    }
+
+    #[test]
+    fn plan_retries_only_a_failed_download_lookup() {
+        let Plan::Downloads(entry) = plan(Some(entry(None))) else {
+            panic!("expected a download retry");
+        };
+        assert_eq!(entry.metadata.description.as_deref(), Some("A lib"));
+    }
+
+    #[test]
+    fn failed_download_lookup_is_retried_from_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lib.json");
+        let fetched_at = Utc::now();
+        write_cache(&path, &parse_document(&sample_document(), None), fetched_at).unwrap();
+        let cached = read_cached(&path, fetched_at);
+        assert!(matches!(plan(cached), Plan::Downloads(_)));
+
+        // A successful retry is cached without extending the entry's TTL.
+        let later = fetched_at + chrono::Duration::hours(CACHE_TTL_HOURS - 1);
+        write_cache(
+            &path,
+            &parse_document(&sample_document(), Some(7)),
+            fetched_at,
+        )
+        .unwrap();
+        let Plan::Cached(metadata) = plan(read_cached(&path, later)) else {
+            panic!("expected a cache hit");
+        };
+        assert_eq!(metadata.downloads, Some(7));
+        let expired = fetched_at + chrono::Duration::hours(CACHE_TTL_HOURS);
+        assert!(matches!(
+            plan(read_cached(&path, expired)),
+            Plan::Everything
+        ));
     }
 
     #[test]
@@ -354,9 +447,11 @@ mod tests {
         assert!(read_cached(&path, now).is_none());
 
         let mut entry: Value = serde_json::from_slice(&bytes).unwrap();
-        entry["format"] = json!(CACHE_FORMAT + 1);
-        fs::write(&path, serde_json::to_vec(&entry).unwrap()).unwrap();
-        assert!(read_cached(&path, now).is_none());
+        for format in [CACHE_FORMAT - 1, CACHE_FORMAT + 1] {
+            entry["format"] = json!(format);
+            fs::write(&path, serde_json::to_vec(&entry).unwrap()).unwrap();
+            assert!(read_cached(&path, now).is_none());
+        }
     }
 
     #[test]
