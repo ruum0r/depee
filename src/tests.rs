@@ -170,6 +170,26 @@ fn pending_update_respects_version_and_skip() {
 }
 
 #[test]
+fn release_version_requires_v_prefixed_semver_tag() {
+    assert_eq!(release_version("v1.2.3").as_deref(), Some("1.2.3"));
+    assert_eq!(
+        release_version("v1.2.3-rc.1").as_deref(),
+        Some("1.2.3-rc.1")
+    );
+    assert_eq!(release_version("1.2.3"), None);
+    assert_eq!(release_version("vv1.2.3"), None);
+    assert_eq!(release_version("v1.2"), None);
+}
+
+#[test]
+fn install_script_url_is_pinned_to_tag() {
+    assert_eq!(
+        install_script_url("1.2.3"),
+        "https://raw.githubusercontent.com/ruum0r/depee/v1.2.3/install.sh"
+    );
+}
+
+#[test]
 fn update_cache_without_skipped_version_parses() {
     let cache: UpdateCheckCache =
         serde_json::from_str(r#"{"checked_at":"2026-01-01T00:00:00Z","latest_version":"9.9.9"}"#)

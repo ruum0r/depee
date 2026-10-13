@@ -141,7 +141,11 @@ struct UpdatePrompt {
     selected: usize,
 }
 const UPDATE_CHOICES: [&str; 3] = ["Update now", "Skip this version", "Remind me later"];
-const INSTALL_SCRIPT_URL: &str = "https://raw.githubusercontent.com/ruum0r/depee/main/install.sh";
+/// Pinned to the release tag (protected by a ruleset) rather than a branch, so
+/// updates only run an installer that shipped with that release.
+fn install_script_url(version: &str) -> String {
+    format!("https://raw.githubusercontent.com/ruum0r/depee/v{version}/install.sh")
+}
 enum Msg {
     Scan(Result<(Vec<Package>, Option<String>), String>),
     Metadata(usize, Result<Metadata, String>),
@@ -1585,8 +1589,7 @@ async fn refresh_update_cache() -> Result<()> {
     let latest_version = release
         .get("tag_name")
         .and_then(Value::as_str)
-        .map(|tag| tag.trim_start_matches('v').to_string())
-        .filter(|version| semver::Version::parse(version).is_ok());
+        .and_then(release_version);
 
     // Re-read so a version skipped while the request was in flight is kept.
     let skipped_version = read_update_cache().and_then(|cache| cache.skipped_version);
@@ -1615,20 +1618,32 @@ fn install_update(version: &str) -> Result<()> {
         .parent()
         .ok_or_else(|| anyhow!("Could not determine the install directory"))?;
     println!("Updating depee to v{version}…");
+    // The URL is passed as an argument so it is never parsed as shell code.
     let error = std::process::Command::new("sh")
         .arg("-c")
-        .arg(format!(
-            "curl -fsSL {INSTALL_SCRIPT_URL} | sh && echo 'Restart depee to use the new version.'"
-        ))
+        .arg(r#"curl -fsSL "$1" | sh && echo 'Restart depee to use the new version.'"#)
+        .arg("sh")
+        .arg(install_script_url(version))
         .env("DEPEE_INSTALL_DIR", install_dir)
+        .env("DEPEE_VERSION", version)
         .exec();
     Err(error).context("Could not run the installer")
 }
 
 #[cfg(not(unix))]
-fn install_update(_version: &str) -> Result<()> {
-    println!("Install the update with: curl -fsSL {INSTALL_SCRIPT_URL} | sh");
+fn install_update(version: &str) -> Result<()> {
+    println!(
+        "Install the update with: curl -fsSL {} | DEPEE_VERSION={version} sh",
+        install_script_url(version)
+    );
     Ok(())
+}
+
+/// Only `v`-prefixed semver tags are releases; the tag ruleset protects that namespace.
+fn release_version(tag: &str) -> Option<String> {
+    let version = tag.strip_prefix('v')?;
+    semver::Version::parse(version).ok()?;
+    Some(version.to_string())
 }
 
 fn is_newer(version: &str) -> bool {
