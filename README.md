@@ -27,11 +27,13 @@ curl -fsSL https://raw.githubusercontent.com/ruum0r/depee/main/install.sh | sh
 ```
 
 The installer puts `depee` in `~/.local/bin`. Set `DEPEE_INSTALL_DIR` to choose a
-different directory. Make sure the install directory is on your `PATH`.
+different directory. Make sure the install directory is on your `PATH`. Set
+`DEPEE_VERSION` (for example `0.3.0`) to install a specific release instead of
+the latest one.
 
 When a newer version is available, `depee` opens with an update screen. Choose
-**Update now** to run the installer into the directory of the running `depee`
-binary, **Skip this version** to stop being asked about that release, or
+**Update now** to run that release's installer (fetched from its version tag)
+into the directory of the running `depee` binary, **Skip this version** to stop being asked about that release, or
 **Remind me later** (Esc) to continue to the dependency list.
 
 `depee` checks GitHub Releases in the background at most once every 24 hours.
@@ -60,6 +62,7 @@ also verify it manually after downloading an archive:
 
 ```sh
 gh attestation verify depee-aarch64-apple-darwin.tar.gz --repo ruum0r/depee \
+  --hostname github.com \
   --cert-identity-regex '^https://github\.com/ruum0r/depee/\.github/workflows/release\.yml@refs/tags/v'
 ```
 
