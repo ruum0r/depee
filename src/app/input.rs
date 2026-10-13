@@ -47,8 +47,34 @@ impl App {
             Mode::Search(_) => self.handle_search_key(k),
             Mode::VersionPicker => self.handle_version_picker_key(k),
             Mode::Confirm(_) => self.handle_confirm_key(k),
+            Mode::WorkspacePicker(_) => self.handle_workspace_picker_key(k),
         }
         Ok(())
+    }
+
+    fn handle_workspace_picker_key(&mut self, k: KeyEvent) {
+        let len = self
+            .project
+            .workspace
+            .as_ref()
+            .map_or(0, |w| w.members.len());
+        let Mode::WorkspacePicker(picker) = &mut self.mode else {
+            return;
+        };
+        if let Some(d) = nav_delta(&k, true) {
+            picker.selected = step(picker.selected, d, len);
+            return;
+        }
+        if k.modifiers.contains(KeyModifiers::CONTROL) {
+            return;
+        }
+        let selected = picker.selected;
+        match k.code {
+            KeyCode::Enter => self.switch_workspace(selected),
+            KeyCode::Esc | KeyCode::Char('w') => self.cancel_workspace_picker(),
+            KeyCode::Char('q') => self.should_quit = true,
+            _ => {}
+        }
     }
 
     fn handle_update_prompt_key(&mut self, k: KeyEvent) {
@@ -101,12 +127,24 @@ impl App {
                 self.request_metadata(self.selected);
             }
             KeyCode::Char('c') => self.open_changelog()?,
+            KeyCode::Char('w') if self.project.workspace.is_some() => {
+                if self.updating {
+                    self.status = "Wait for the update to finish before switching members".into();
+                } else {
+                    self.open_workspace_picker(false);
+                }
+            }
             KeyCode::Char('e') => {
                 if let Some(error) = &self.error {
                     self.status = error.clone();
                 }
             }
-            KeyCode::Char('?') => self.status = HELP.into(),
+            KeyCode::Char('?') => {
+                self.status = HELP.into();
+                if self.project.workspace.is_some() {
+                    self.status.push_str(" · w workspace");
+                }
+            }
             _ => {}
         }
         Ok(())
@@ -218,7 +256,7 @@ fn open_url(url: &str) -> Result<()> {
 mod tests {
     use super::*;
     use crate::{
-        app::{fixtures::app, MetadataStatus, Sort, UpdatePrompt},
+        app::{fixtures::app, MetadataStatus, Sort, UpdatePrompt, Workspace},
         package::fixtures::{package, release},
     };
 
@@ -286,6 +324,81 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         assert!(matches!(app.mode, Mode::Browse));
         assert_eq!(app.visible(), [0, 1, 2]);
+    }
+
+    fn workspace_app(dir: &std::path::Path) -> App {
+        let mut app = app();
+        let member = |path: &str| crate::workspace::Member {
+            dir: dir.join(path),
+            path: path.into(),
+            name: None,
+        };
+        app.project.cwd = dir.to_path_buf();
+        app.project.workspace = Some(Workspace {
+            root: dir.to_path_buf(),
+            member: String::new(),
+            members: vec![member(""), member("packages/a"), member("packages/b")],
+        });
+        app
+    }
+
+    fn picked(app: &App) -> usize {
+        app.workspace_picker().unwrap().selected
+    }
+
+    #[test]
+    fn workspace_picker_moves_and_cancels() {
+        // `w` does nothing outside a workspace.
+        let mut standalone = app();
+        press(&mut standalone, KeyCode::Char('w'));
+        assert!(matches!(standalone.mode, Mode::Browse));
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = workspace_app(dir.path());
+        press(&mut app, KeyCode::Char('w'));
+        assert_eq!(picked(&app), 0);
+        assert!(!app.workspace_picker().unwrap().startup);
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(picked(&app), 2);
+        press(&mut app, KeyCode::Char('k'));
+        assert_eq!(picked(&app), 1);
+        // Ctrl chords are not letter shortcuts.
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL))
+            .unwrap();
+        assert!(!app.should_quit);
+        press(&mut app, KeyCode::Esc);
+        assert!(matches!(app.mode, Mode::Browse));
+        assert!(!app.loading);
+
+        // The member directory is missing, so the switch fails visibly and
+        // the project stays the root.
+        press(&mut app, KeyCode::Char('w'));
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.mode, Mode::Browse));
+        assert!(app
+            .status
+            .contains("Workspace member not found: packages/a"));
+        assert_eq!(app.project.workspace.as_ref().unwrap().member, "");
+
+        // While updating, the picker does not open.
+        app.updating = true;
+        press(&mut app, KeyCode::Char('w'));
+        assert!(matches!(app.mode, Mode::Browse));
+    }
+
+    #[tokio::test]
+    async fn startup_picker_falls_back_to_the_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = workspace_app(dir.path());
+        app.open_workspace_picker(true);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Esc);
+        assert!(matches!(app.mode, Mode::Browse));
+        assert_eq!(app.project.workspace.as_ref().unwrap().member, "");
+        assert!(app.loading, "the root is scanned instead");
     }
 
     #[test]

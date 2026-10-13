@@ -15,6 +15,9 @@ pub struct Cli {
     pub cwd: PathBuf,
     #[arg(long, value_enum)]
     pub pm: Option<Pm>,
+    /// Workspace member to inspect, by package name or path from the root.
+    #[arg(long, value_name = "NAME|PATH")]
+    pub workspace: Option<String>,
     #[arg(long)]
     pub clear_cache: bool,
 }

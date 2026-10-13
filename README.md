@@ -10,6 +10,7 @@ uses that package manager's CLI to find outdated packages.
 cargo run --release
 cargo run --release -- --cwd ./my-project
 cargo run --release -- --pm pnpm
+cargo run --release -- --workspace web
 ```
 
 The `--pm` option accepts `npm`, `pnpm`, `yarn`, or `bun`. It overrides
@@ -24,7 +25,23 @@ detected from the root's lockfiles and `.yarnrc.yml`, and from the
 `packageManager` field of the member or, failing that, the root. Scans and
 updates still run in the member directory, so they cover only the member's
 dependencies. The header shows the member path, for example
-`web (workspace: packages/web)`.
+`web (workspace: packages/web)`, or `(workspace: root)` at the root.
+
+Members are listed from the root's `package.json` `workspaces` (an array or
+`{ "packages": [...] }`) and the `packages:` list of `pnpm-workspace.yaml`.
+Patterns may use `*` within a directory name, `**` for any number of
+directories, and a leading `!` to exclude matches. A member is a directory with
+a `package.json`; it is shown by its relative path and package name. Patterns
+with `..` or absolute paths are ignored, and the search stays below the root:
+it skips `node_modules`, dot-directories, and symlinks, and stops after eight
+directory levels.
+
+Started at a workspace root that has members, depee first opens the member
+picker; Esc there inspects the root itself. Press `w` to switch to another
+member later; packages are then rescanned in the chosen member. Pass
+`--workspace <name|path>` (a package name or a path relative to the root, `.`
+for the root) to start in a member directly. Switching is unavailable while an
+update runs, and updates wait until the member's scan has finished.
 
 ## Install (macOS and Linux)
 
@@ -94,6 +111,8 @@ Replace the archive name with the one for your platform.
 | `c` | Open repository releases or package homepage |
 | `r` | Refresh package data |
 | `e` | Show the last update error |
+| `w` | Choose a workspace member (inside a workspace) |
+| `Enter` / `Esc` in member picker | Switch to the member / cancel (at startup: inspect the root) |
 | `?` | Show the key summary |
 | `q`, `Ctrl+c` | Quit |
 
@@ -117,8 +136,10 @@ only after confirmation.
   Bun's JSON output and the common pnpm/Yarn JSON forms are supported; unusual
   CLI output may need parser adjustments.
 - Yarn Plug'n'Play is not managed as a separate project model.
-- Workspaces are inspected one member at a time (run depee in the member's
-  directory); there is no combined view of all members.
+- Workspaces are inspected one member at a time (switch with `w` or
+  `--workspace`); there is no combined view of all members.
+- Member patterns support `*`, `**`, and `!` exclusions only; brace and
+  character-class globs are not expanded.
 - Registry metadata is fetched from the public npm Registry, so private
   registries and packages may not provide details.
 - Update commands inherit the package manager's behavior; there is no automatic

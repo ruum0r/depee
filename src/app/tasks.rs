@@ -1,4 +1,5 @@
-//! Background work started by the app. Each task reports back through a `Msg`.
+//! Background work started by the app. Each task reports back through a `Msg`
+//! tagged with the epoch it was started in.
 
 use tokio::process::Command;
 
@@ -6,16 +7,16 @@ use super::{App, MetadataStatus, Msg, UpdatePrompt};
 use crate::{pm, registry, self_update};
 
 impl App {
-    /// Kicks off the initial scan, toolchain probes, and the self-update check.
-    pub fn start(&mut self) {
-        self.spawn_scan();
-        let pm = self.project.pm;
-        let tx = self.tx.clone();
-        let mut pm_version = Command::new(pm.name());
-        pm_version.current_dir(&self.project.cwd);
-        tokio::spawn(async move {
-            let _ = tx.send(Msg::PmVersion(tool_version(pm_version).await));
-        });
+    /// Kicks off the initial scan (unless the workspace picker comes first),
+    /// toolchain probes, and the self-update check.
+    pub fn start(&mut self, pick_workspace: bool) {
+        if pick_workspace {
+            self.open_workspace_picker(true);
+        }
+        if self.workspace_picker().is_none() {
+            self.spawn_scan();
+        }
+        self.spawn_pm_version();
         let tx = self.tx.clone();
         tokio::spawn(async move {
             let version = tool_version(Command::new("node")).await;
@@ -38,15 +39,26 @@ impl App {
         }
     }
 
-    fn spawn_scan(&mut self) {
+    pub(super) fn spawn_pm_version(&mut self) {
+        let mut command = Command::new(self.project.pm.name());
+        command.current_dir(&self.project.cwd);
+        let epoch = self.epoch;
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let _ = tx.send(Msg::PmVersion(epoch, tool_version(command).await));
+        });
+    }
+
+    pub(super) fn spawn_scan(&mut self) {
         self.loading = true;
         self.status = "Loading dependencies…".into();
         let cwd = self.project.cwd.clone();
         let pm = self.project.pm;
+        let epoch = self.epoch;
         let tx = self.tx.clone();
         tokio::spawn(async move {
             let result = pm::scan(&cwd, pm).await.map_err(|e| format!("{e:#}"));
-            let _ = tx.send(Msg::Scan(result));
+            let _ = tx.send(Msg::Scan(epoch, result));
         });
     }
 
@@ -63,6 +75,7 @@ impl App {
         };
         self.metadata.insert(index, MetadataStatus::Loading);
         let name = package.name.clone();
+        let epoch = self.epoch;
         let tx = self.tx.clone();
         let limit = self.metadata_limit.clone();
         tokio::spawn(async move {
@@ -72,11 +85,17 @@ impl App {
             let result = registry::fetch_metadata(&name)
                 .await
                 .map_err(|e| format!("{e:#}"));
-            let _ = tx.send(Msg::Metadata(index, result));
+            let _ = tx.send(Msg::Metadata(epoch, index, result));
         });
     }
 
     pub fn start_update(&mut self) {
+        // During a scan the list may still belong to the member being left.
+        if self.loading || self.updating {
+            self.close_confirm();
+            self.status = "Wait for the current scan or update to finish".into();
+            return;
+        }
         let Some(request) = self.update_request() else {
             return;
         };
@@ -85,9 +104,11 @@ impl App {
         self.status = "Updating…".into();
         let cwd = self.project.cwd.clone();
         let pm = self.project.pm;
+        let epoch = self.epoch;
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let _ = tx.send(Msg::Update(pm::run_update(&cwd, pm, &request).await));
+            let result = pm::run_update(&cwd, pm, &request).await;
+            let _ = tx.send(Msg::Update(epoch, result));
         });
     }
 }

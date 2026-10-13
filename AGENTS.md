@@ -28,8 +28,9 @@ src/
 ├── cli.rs           clap arguments
 ├── event.rs         Blocking crossterm reader → async channel
 ├── app/             Application state and every state transition
-│   ├── mod.rs       App, ProjectInfo, Workspace, Mode, Confirm, Sort, MetadataStatus,
-│   │                UpdatePrompt; queries (visible, target, update_request…)
+│   ├── mod.rs       App, ProjectInfo, Workspace, Mode, Confirm, WorkspacePicker,
+│   │                Sort, MetadataStatus, UpdatePrompt; queries (visible,
+│   │                target, update_request…); switch_workspace
 │   ├── input.rs     Key handling, one handler per mode; nav_delta / step
 │   ├── message.rs   Msg enum and App::handle_message (background results)
 │   └── tasks.rs     Spawning background work (scan, metadata, update, probes)
@@ -39,9 +40,11 @@ src/
 │   ├── details.rs   Details pane and version picker
 │   ├── confirm.rs   Update confirmation and compatibility inspection
 │   ├── update_prompt.rs  Startup self-update screen
+│   ├── workspace.rs Workspace member picker
 │   └── text.rs      DetailLines builder, wrapping, formatting (ago, count…)
 ├── package.rs       Package, Release, Metadata, Change, Kind
 ├── project.rs       package.json (Manifest), node_modules lookups, workspace root
+├── workspace.rs     Workspace members: pnpm-workspace.yaml parsing, globs, walk
 ├── pm/              Package managers: detection, `outdated` parsing, update commands
 ├── registry.rs      npm Registry fetch + 12h disk cache; pure JSON → Metadata parser
 ├── compat.rs        npm range matching and dependency diffs
@@ -51,8 +54,8 @@ src/
 
 ### Dependency direction
 
-`main` → `app` / `ui` / `event` → domain modules (`package`, `project`, `pm`,
-`registry`, `compat`, `cache`, `self_update`).
+`main` → `app` / `ui` / `event` → domain modules (`package`, `project`,
+`workspace`, `pm`, `registry`, `compat`, `cache`, `self_update`).
 
 - Domain modules must not import from `app` or `ui`.
 - `ui` reads `&App` and never mutates it. The only exceptions are draw-time
@@ -64,7 +67,8 @@ src/
 ### State and modes
 
 - The main screen is in exactly one `Mode`: `Browse`, `Search(query)`,
-  `VersionPicker`, or `Confirm(Confirm)`. Do not add parallel boolean flags.
+  `VersionPicker`, `Confirm(Confirm)`, or `WorkspacePicker(WorkspacePicker)`.
+  Do not add parallel boolean flags.
   State that only exists in one mode lives in the variant (for example
   `Confirm::pinned`, the version chosen in the picker).
 - `update_prompt` is a separate full-screen gate shown before the main screen.
@@ -91,7 +95,10 @@ src/
 2. Send the result as a `Msg` variant, with errors as `String` (`format!("{e:#}")`).
 3. Apply it in `app/message.rs`.
 
-Tasks never touch `App` directly. Registry requests are limited by a semaphore
+Tasks never touch `App` directly. Project-scoped messages (`Scan`, `Metadata`,
+`PmVersion`, `Update`) carry the `App::epoch` they were spawned in;
+`switch_workspace` bumps it, and `handle_message` drops older results so they
+never land on another member. Registry requests are limited by a semaphore
 (`METADATA_CONCURRENCY`). Failures must stay visible as failures (for example
 `MetadataStatus::Failed`) instead of looking like "no data".
 
@@ -147,6 +154,13 @@ after the change and `diff -r`. Remove the temporary harness afterwards. The
   declaration. `ProjectInfo::load` detects the package manager there (the
   member's `packageManager`, else the root's, then the root's lockfiles and
   `.yarnrc.yml`), but `ProjectInfo::cwd` stays the member: `outdated` and updates run there.
+  `workspace::members` lists the root and its members once at load; switching
+  (`ProjectInfo::switch_to`) reuses that list and `load_in`, so detection rules
+  stay in one place and `--pm` is kept. The walk must stay read-only and below
+  the root: no symlinks, no `..`/absolute patterns, bounded depth and entries.
+  `pnpm-workspace.yaml` is read by a line-based parser for the `packages:`
+  key only; there is no YAML dependency. Switching is refused while updating,
+  and `start_update` refuses while a scan runs.
 - **Compatible updates:** Yarn Berry's bare `yarn up <name>` jumps to latest,
   so in-range updates pin the existing range (`yarn up name@<range>`). Classic
   uses `yarn upgrade`. `pnpm update` and `bun update` rewrite the manifest
