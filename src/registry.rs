@@ -1,6 +1,6 @@
 //! npm Registry client: package documents (cached on disk) and download counts.
 
-use std::{collections::HashMap, fs, path::PathBuf, time::Duration};
+use std::{collections::HashMap, fs, path::PathBuf, sync::OnceLock, time::Duration};
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -13,11 +13,23 @@ use crate::{
 
 const CACHE_TTL_HOURS: i64 = 12;
 
-pub async fn fetch_metadata(name: &str) -> Result<Metadata> {
+/// One client for every registry request, so its connection pool (and the
+/// TLS sessions in it) is shared across packages.
+fn client() -> Result<&'static reqwest::Client> {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    if let Some(client) = CLIENT.get() {
+        return Ok(client);
+    }
+    // A failed build is returned, not cached, so the next request retries.
     let client = reqwest::Client::builder()
         .user_agent("depee/0.1")
         .timeout(Duration::from_secs(12))
         .build()?;
+    Ok(CLIENT.get_or_init(|| client))
+}
+
+pub async fn fetch_metadata(name: &str) -> Result<Metadata> {
+    let client = client()?;
     let encoded = name.replace('/', "%2f");
     let doc = match read_cached(name) {
         Some(doc) => doc,
@@ -167,6 +179,13 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn reuses_one_client() {
+        let first = client().unwrap();
+        let second = client().unwrap();
+        assert!(std::ptr::eq(first, second));
+    }
 
     #[test]
     fn parses_registry_document() {
