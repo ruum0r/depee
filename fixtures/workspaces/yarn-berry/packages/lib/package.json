@@ -1,0 +1,9 @@
+{
+  "name": "@fx/lib",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "is-number": "^6.0.0",
+    "semver": "^5.0.0"
+  }
+}

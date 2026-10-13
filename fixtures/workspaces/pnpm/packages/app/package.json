@@ -1,0 +1,13 @@
+{
+  "name": "@fx/app",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "@fx/lib": "workspace:*",
+    "ms": "^2.0.0",
+    "semver": "^6.0.0"
+  },
+  "devDependencies": {
+    "chalk": "^4.0.0"
+  }
+}

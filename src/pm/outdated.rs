@@ -7,7 +7,10 @@ use serde_json::{Map, Value};
 use tokio::{process::Command, time::timeout};
 
 use super::Pm;
-use crate::{package::Package, project::Manifest};
+use crate::{
+    package::Package,
+    project::{self, Manifest},
+};
 
 /// One row of `outdated` output, before it is matched against package.json.
 #[derive(Debug, PartialEq, Eq)]
@@ -16,6 +19,10 @@ struct OutdatedEntry {
     current: String,
     wanted: Option<String>,
     latest: Option<String>,
+    /// The workspace that declares the dependency, when the package manager
+    /// reports it: npm's `dependent` (the directory name) or Yarn Classic's
+    /// `Workspace` column (the package name).
+    dependent: Option<String>,
 }
 
 pub struct ScanResult {
@@ -27,7 +34,18 @@ pub struct ScanResult {
 
 /// Lists the outdated direct dependencies of the project at `cwd`.
 pub async fn scan(cwd: &Path, pm: Pm) -> Result<ScanResult> {
-    let declared = Manifest::read(cwd)?.declared();
+    let manifest = Manifest::read(cwd)?;
+    // npm and Yarn Classic report rows for every workspace member, not just
+    // the one `outdated` runs in, and say which member each row belongs to.
+    let owner = match pm {
+        Pm::Npm => cwd
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_string),
+        Pm::Yarn => manifest.name.clone(),
+        Pm::Pnpm | Pm::Bun => None,
+    };
+    let declared = manifest.declared();
     let args: &[&str] = match pm {
         Pm::Pnpm => &["outdated", "--format", "json"],
         Pm::Npm | Pm::Yarn | Pm::Bun => &["outdated", "--json"],
@@ -57,7 +75,10 @@ pub async fn scan(cwd: &Path, pm: Pm) -> Result<ScanResult> {
         )),
         _ => None,
     };
-    let mut packages: Vec<Package> = parse_outdated(pm, &data)
+    let entries = own_entries(parse_outdated(pm, &data), owner.as_deref(), |name| {
+        project::installed_version(cwd, name)
+    });
+    let mut packages: Vec<Package> = entries
         .into_iter()
         .filter_map(|entry| {
             let (current_spec, kind) = declared.get(&entry.name)?;
@@ -80,6 +101,46 @@ pub async fn scan(cwd: &Path, pm: Pm) -> Result<ScanResult> {
         .collect();
     packages.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(ScanResult { packages, warning })
+}
+
+/// Keeps the rows that belong to `owner` (rows without a dependent always
+/// count), then one row per package. When several remain, for example two
+/// members whose directories share a name, the one whose `current` matches
+/// the version installed for this project wins, else the first.
+fn own_entries(
+    entries: Vec<OutdatedEntry>,
+    owner: Option<&str>,
+    installed: impl Fn(&str) -> Option<String>,
+) -> Vec<OutdatedEntry> {
+    let mut by_name: HashMap<String, Vec<OutdatedEntry>> = HashMap::new();
+    let mut order = vec![];
+    for entry in entries {
+        let mine = match (owner, &entry.dependent) {
+            (Some(owner), Some(dependent)) => owner == dependent,
+            _ => true,
+        };
+        if !mine {
+            continue;
+        }
+        if !by_name.contains_key(&entry.name) {
+            order.push(entry.name.clone());
+        }
+        by_name.entry(entry.name.clone()).or_default().push(entry);
+    }
+    order
+        .into_iter()
+        .filter_map(|name| {
+            let mut candidates = by_name.remove(&name)?;
+            if candidates.len() > 1 {
+                if let Some(version) = installed(&name) {
+                    if let Some(i) = candidates.iter().position(|e| e.current == version) {
+                        return Some(candidates.swap_remove(i));
+                    }
+                }
+            }
+            Some(candidates.swap_remove(0))
+        })
+        .collect()
 }
 
 async fn outdated_json(cwd: &Path, pm: Pm, args: &[&str]) -> Result<Value> {
@@ -151,7 +212,13 @@ fn parse_keyed_or_list(
 ) {
     if let Some(object) = v.as_object() {
         for (name, item) in object {
-            if let Some(fields) = item.as_object() {
+            // npm lists one object per dependent workspace when several
+            // members depend on the same package.
+            let items = match item {
+                Value::Array(items) => items.as_slice(),
+                item => std::slice::from_ref(item),
+            };
+            for fields in items.iter().filter_map(Value::as_object) {
                 out.push(entry(name, fields));
             }
         }
@@ -177,6 +244,7 @@ fn parse_yarn_table(table: &Map<String, Value>, out: &mut Vec<OutdatedEntry>) {
                 .is_some_and(|head| head.eq_ignore_ascii_case(label))
         })
     };
+    let workspace_i = column("Workspace");
     let (Some(name_i), Some(current_i), Some(wanted_i), Some(latest_i)) = (
         column("Package"),
         column("Current"),
@@ -193,6 +261,7 @@ fn parse_yarn_table(table: &Map<String, Value>, out: &mut Vec<OutdatedEntry>) {
             current: at(current_i).unwrap_or("N/A").to_string(),
             wanted: at(wanted_i).map(str::to_string),
             latest: at(latest_i).map(str::to_string),
+            dependent: workspace_i.and_then(at).map(str::to_string),
         });
     }
 }
@@ -203,6 +272,7 @@ fn entry(name: &str, fields: &Map<String, Value>) -> OutdatedEntry {
         current: field(fields, &["current"]).unwrap_or("N/A").to_string(),
         wanted: field(fields, &["wanted"]).map(str::to_string),
         latest: field(fields, &["latest"]).map(str::to_string),
+        dependent: field(fields, &["dependent"]).map(str::to_string),
     }
 }
 
@@ -223,7 +293,13 @@ mod tests {
             current: current.into(),
             wanted: Some(wanted.into()),
             latest: Some(latest.into()),
+            dependent: None,
         }
+    }
+
+    fn owned(mut entry: OutdatedEntry, dependent: &str) -> OutdatedEntry {
+        entry.dependent = Some(dependent.into());
+        entry
     }
 
     #[test]
@@ -282,6 +358,115 @@ mod tests {
             parse_outdated(Pm::Yarn, &v),
             [entry("left-pad", "1.0.0", "1.3.0", "2.0.0")]
         );
+    }
+
+    #[test]
+    fn npm_workspace_arrays_parse_one_entry_per_dependent() {
+        let v = json!({
+            "chalk": {"current":"4.1.2","wanted":"4.1.2","latest":"6.0.1",
+                      "dependent":"app","location":"node_modules/chalk"},
+            "semver": [
+                {"current":"6.3.1","wanted":"6.3.1","latest":"7.8.5",
+                 "dependent":"app","location":"node_modules/semver"},
+                {"current":"5.7.2","wanted":"5.7.2","latest":"7.8.5",
+                 "dependent":"lib","location":"packages/lib/node_modules/semver"}
+            ]
+        });
+        assert_eq!(
+            parse_outdated(Pm::Npm, &v),
+            [
+                owned(entry("chalk", "4.1.2", "4.1.2", "6.0.1"), "app"),
+                owned(entry("semver", "6.3.1", "6.3.1", "7.8.5"), "app"),
+                owned(entry("semver", "5.7.2", "5.7.2", "7.8.5"), "lib"),
+            ]
+        );
+    }
+
+    #[test]
+    fn yarn_classic_reads_workspace_column() {
+        let v = json!([
+            {"type":"table","data":{
+                "head":["Package","Current","Wanted","Latest","Workspace","Package Type","URL"],
+                "body":[
+                    ["kleur","3.0.3","3.0.3","4.1.5","fx-yarn-classic","devDependencies",""],
+                    ["semver","6.3.1","6.3.1","7.8.5","@fx/app","dependencies",""],
+                    ["semver","5.7.2","5.7.2","7.8.5","@fx/lib","dependencies",""]
+                ]
+            }}
+        ]);
+        assert_eq!(
+            parse_outdated(Pm::Yarn, &v),
+            [
+                owned(entry("kleur", "3.0.3", "3.0.3", "4.1.5"), "fx-yarn-classic"),
+                owned(entry("semver", "6.3.1", "6.3.1", "7.8.5"), "@fx/app"),
+                owned(entry("semver", "5.7.2", "5.7.2", "7.8.5"), "@fx/lib"),
+            ]
+        );
+    }
+
+    #[test]
+    fn only_the_owners_entries_are_kept() {
+        let entries = || {
+            vec![
+                owned(entry("kleur", "3.0.3", "3.0.3", "4.1.5"), "npm"),
+                owned(entry("semver", "6.3.1", "6.3.1", "7.8.5"), "app"),
+                owned(entry("semver", "5.7.2", "5.7.2", "7.8.5"), "lib"),
+                owned(entry("is-number", "6.0.0", "6.0.0", "7.0.0"), "lib"),
+            ]
+        };
+        let names = |entries: Vec<OutdatedEntry>| {
+            entries
+                .into_iter()
+                .map(|e| format!("{}@{}", e.name, e.current))
+                .collect::<Vec<_>>()
+        };
+        let none = |_: &str| None;
+        assert_eq!(
+            names(own_entries(entries(), Some("app"), none)),
+            ["semver@6.3.1"]
+        );
+        assert_eq!(
+            names(own_entries(entries(), Some("lib"), none)),
+            ["semver@5.7.2", "is-number@6.0.0"]
+        );
+        assert_eq!(
+            names(own_entries(entries(), Some("npm"), none)),
+            ["kleur@3.0.3"]
+        );
+    }
+
+    #[test]
+    fn entries_without_dependent_are_kept() {
+        let v = vec![entry("vite", "1.0.0", "1.2.0", "2.0.0")];
+        assert_eq!(
+            own_entries(v, Some("app"), |_| None),
+            [entry("vite", "1.0.0", "1.2.0", "2.0.0")]
+        );
+        let v = vec![owned(entry("vite", "1.0.0", "1.2.0", "2.0.0"), "web")];
+        assert_eq!(own_entries(v, None, |_| None).len(), 1);
+    }
+
+    #[test]
+    fn duplicates_prefer_the_installed_version_else_the_first() {
+        // Two members whose directories are both named `app`.
+        let entries = || {
+            vec![
+                owned(entry("semver", "6.3.1", "6.3.1", "7.8.5"), "app"),
+                owned(entry("semver", "5.7.2", "5.7.2", "7.8.5"), "app"),
+            ]
+        };
+        let pick = |installed: Option<&str>| {
+            let installed = installed.map(str::to_string);
+            let kept = own_entries(entries(), Some("app"), |name| {
+                assert_eq!(name, "semver");
+                installed.clone()
+            });
+            assert_eq!(kept.len(), 1);
+            kept[0].current.clone()
+        };
+        assert_eq!(pick(Some("5.7.2")), "5.7.2");
+        assert_eq!(pick(Some("4.0.0")), "6.3.1");
+        assert_eq!(pick(None), "6.3.1");
     }
 
     #[test]

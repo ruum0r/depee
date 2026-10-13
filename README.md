@@ -24,7 +24,10 @@ root (the first directory containing `.git`). The package manager is then
 detected from the root's lockfiles and `.yarnrc.yml`, and from the
 `packageManager` field of the member or, failing that, the root. Scans and
 updates still run in the member directory, so they cover only the member's
-dependencies. The header shows the member path, for example
+dependencies. npm and Yarn Classic report outdated rows for every member
+wherever they run, so depee keeps only the rows whose dependent is the scanned
+project: the member's directory name for npm, its package name for Yarn
+Classic. The header shows the member path, for example
 `web (workspace: packages/web)`, or `(workspace: root)` at the root.
 
 Members are listed from the root's `package.json` `workspaces` (an array or
@@ -141,6 +144,9 @@ only after confirmation.
 - Yarn Plug'n'Play is not managed as a separate project model.
 - Workspaces are inspected one member at a time (switch with `w` or
   `--workspace`); there is no combined view of all members.
+- npm identifies workspace members by directory name only. If two members
+  share one, depee keeps a single row per package, preferring the version
+  installed for the scanned member.
 - Member patterns support `*`, `**`, and `!` exclusions only; brace and
   character-class globs are not expanded.
 - Registry metadata is fetched from the public npm Registry, so private
