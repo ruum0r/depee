@@ -161,6 +161,17 @@ after the change and `diff -r`. Remove the temporary harness afterwards. The
   `pnpm-workspace.yaml` is read by a line-based parser for the `packages:`
   key only; there is no YAML dependency. Switching is refused while updating,
   and `start_update` refuses while a scan runs.
+- **Workspace rows:** npm and Yarn Classic `outdated` list every member's
+  dependencies even when run in one member. npm's `dependent` is the member's
+  directory name (and a package used by several members becomes an array of
+  objects); Yarn Classic's `Workspace` column is the package name. `scan`
+  keeps the scanned project's rows via `own_entries` (rows without a dependent
+  are kept; duplicates prefer the installed `current`). `npm outdated
+  --workspace` does not filter this. pnpm already scopes to the member.
+- **Fixtures:** `fixtures/workspaces` holds small npm, pnpm, Yarn Classic,
+  Yarn Berry and Bun monorepos for manual checks against real package managers
+  (see its README). Install with scripts disabled and run
+  `check-release-age.sh` afterwards; never commit `node_modules`.
 - **Compatible updates:** Yarn Berry's bare `yarn up <name>` jumps to latest,
   so in-range updates pin the existing range (`yarn up name@<range>`). Classic
   uses `yarn upgrade`. `pnpm update` and `bun update` rewrite the manifest
