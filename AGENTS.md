@@ -28,7 +28,7 @@ src/
 ├── cli.rs           clap arguments
 ├── event.rs         Blocking crossterm reader → async channel
 ├── app/             Application state and every state transition
-│   ├── mod.rs       App, ProjectInfo, Mode, Confirm, Sort, MetadataStatus,
+│   ├── mod.rs       App, ProjectInfo, Workspace, Mode, Confirm, Sort, MetadataStatus,
 │   │                UpdatePrompt; queries (visible, target, update_request…)
 │   ├── input.rs     Key handling, one handler per mode; nav_delta / step
 │   ├── message.rs   Msg enum and App::handle_message (background results)
@@ -41,7 +41,7 @@ src/
 │   ├── update_prompt.rs  Startup self-update screen
 │   └── text.rs      DetailLines builder, wrapping, formatting (ago, count…)
 ├── package.rs       Package, Release, Metadata, Change, Kind
-├── project.rs       package.json (Manifest) and node_modules lookups
+├── project.rs       package.json (Manifest), node_modules lookups, workspace root
 ├── pm/              Package managers: detection, `outdated` parsing, update commands
 ├── registry.rs      npm Registry fetch + 12h disk cache; pure JSON → Metadata parser
 ├── compat.rs        npm range matching and dependency diffs
@@ -142,6 +142,11 @@ after the change and `diff -r`. Remove the temporary harness afterwards. The
   NDJSON with a `table` row, and pnpm's `wanted` is the lockfile resolution, so
   `scan` runs `pnpm outdated --compatible` separately. `outdated` exits with
   code 1 when something is outdated; that is not an error.
+- **Workspaces:** `project::find_workspace_root` walks up from `cwd` (stopping
+  after the first `.git`) to the nearest `pnpm-workspace.yaml` or `workspaces`
+  declaration. `ProjectInfo::load` detects the package manager there (the
+  member's `packageManager`, else the root's, then the root's lockfiles and
+  `.yarnrc.yml`), but `ProjectInfo::cwd` stays the member: `outdated` and updates run there.
 - **Compatible updates:** Yarn Berry's bare `yarn up <name>` jumps to latest,
   so in-range updates pin the existing range (`yarn up name@<range>`). Classic
   uses `yarn upgrade`. `pnpm update` and `bun update` rewrite the manifest

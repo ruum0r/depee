@@ -16,6 +16,16 @@ The `--pm` option accepts `npm`, `pnpm`, `yarn`, or `bun`. It overrides
 `packageManager` in `package.json` and lockfile detection. The selected package
 manager must be installed and available on `PATH`.
 
+Inside a workspace (monorepo) member such as `packages/web`, depee looks upward
+for the workspace root: the nearest directory with `pnpm-workspace.yaml` or a
+`package.json` that declares `workspaces`. The search stops at the repository
+root (the first directory containing `.git`). The package manager is then
+detected from the root's lockfiles and `.yarnrc.yml`, and from the
+`packageManager` field of the member or, failing that, the root. Scans and
+updates still run in the member directory, so they cover only the member's
+dependencies. The header shows the member path, for example
+`web (workspace: packages/web)`.
+
 ## Install (macOS and Linux)
 
 Release binaries are built for macOS (Apple Silicon and Intel) and Linux
@@ -106,7 +116,9 @@ only after confirmation.
 - `outdated` output formats vary between package manager releases. npm and
   Bun's JSON output and the common pnpm/Yarn JSON forms are supported; unusual
   CLI output may need parser adjustments.
-- Yarn Plug'n'Play and workspaces are not managed as a separate project model.
+- Yarn Plug'n'Play is not managed as a separate project model.
+- Workspaces are inspected one member at a time (run depee in the member's
+  directory); there is no combined view of all members.
 - Registry metadata is fetched from the public npm Registry, so private
   registries and packages may not provide details.
 - Update commands inherit the package manager's behavior; there is no automatic

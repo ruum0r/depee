@@ -60,9 +60,14 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         "READY"
     };
     let project = &app.project;
+    let member = project
+        .workspace
+        .as_ref()
+        .map(|workspace| format!(" (workspace: {})", workspace.member))
+        .unwrap_or_default();
     f.render_widget(
         Paragraph::new(format!(
-            " depee · {} · {} {} · {} outdated / {} total · {state} ",
+            " depee · {}{member} · {} {} · {} outdated / {} total · {state} ",
             project.name,
             project.pm.name(),
             project.pm_version,
@@ -147,7 +152,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        app::{fixtures::app, MetadataStatus, UpdatePrompt},
+        app::{fixtures::app, MetadataStatus, UpdatePrompt, Workspace},
         package::fixtures::{package, release},
     };
 
@@ -188,6 +193,17 @@ mod tests {
                 render(&app, width, height);
             }
         }
+    }
+
+    #[test]
+    fn header_shows_the_workspace_member() {
+        let mut app = loaded_app();
+        assert!(!render(&app, 120, 30).contains("workspace:"));
+        app.project.workspace = Some(Workspace {
+            root: "/repo".into(),
+            member: "packages/web".into(),
+        });
+        assert!(render(&app, 120, 30).contains(" depee · test (workspace: packages/web) · npm "));
     }
 
     #[test]

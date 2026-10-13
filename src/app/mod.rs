@@ -36,6 +36,16 @@ pub struct ProjectInfo {
     pub node_version: String,
     /// Declared dependencies, outdated or not.
     pub total: usize,
+    /// Set when `cwd` is a member below a workspace root.
+    pub workspace: Option<Workspace>,
+}
+
+/// The workspace enclosing a member project. Package manager detection uses
+/// its root; scans and updates still run in the member directory.
+pub struct Workspace {
+    pub root: PathBuf,
+    /// The member directory relative to `root`, `/`-separated.
+    pub member: String,
 }
 
 impl ProjectInfo {
@@ -44,9 +54,26 @@ impl ProjectInfo {
             .canonicalize()
             .with_context(|| format!("Project directory not found: {}", cwd.display()))?;
         let manifest = Manifest::read(&cwd)?;
-        let pm = Pm::detect(pm_override, manifest.package_manager.as_deref(), &cwd)?;
-        let yarn_berry =
-            pm == Pm::Yarn && pm::detect_yarn_berry(manifest.package_manager.as_deref(), &cwd);
+        let workspace = project::find_workspace_root(&cwd).and_then(|root| {
+            let member = cwd.strip_prefix(&root).ok()?;
+            let member = member
+                .iter()
+                .map(|part| part.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/");
+            (!member.is_empty()).then_some(Workspace { root, member })
+        });
+        // Lockfiles and Yarn settings live in the workspace root. The member's
+        // own `packageManager` field wins over the root's.
+        let pm_dir = workspace
+            .as_ref()
+            .map_or(cwd.as_path(), |w| w.root.as_path());
+        let field = manifest.package_manager.clone().or_else(|| {
+            let root = &workspace.as_ref()?.root;
+            Manifest::read(root).ok()?.package_manager
+        });
+        let pm = Pm::detect(pm_override, field.as_deref(), pm_dir)?;
+        let yarn_berry = pm == Pm::Yarn && pm::detect_yarn_berry(field.as_deref(), pm_dir);
         let total = manifest.dependency_count();
         let name = manifest.name.unwrap_or_else(|| {
             cwd.file_name()
@@ -62,6 +89,7 @@ impl ProjectInfo {
             yarn_berry,
             node_version: "checking…".into(),
             total,
+            workspace,
         })
     }
 }
@@ -370,6 +398,7 @@ pub mod fixtures {
             yarn_berry: false,
             node_version: String::new(),
             total: 0,
+            workspace: None,
         };
         App::new(project).0
     }
@@ -465,6 +494,69 @@ mod tests {
             app.installed_version("@scope/peer").as_deref(),
             Some("2.0.0")
         );
+    }
+
+    #[test]
+    fn workspace_members_detect_from_the_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir(root.join(".git")).unwrap();
+        fs::write(
+            root.join("package.json"),
+            r#"{"workspaces":["packages/*"]}"#,
+        )
+        .unwrap();
+        fs::write(root.join("yarn.lock"), "__metadata:\n  version: 8\n").unwrap();
+        let member = root.join("packages/web");
+        fs::create_dir_all(&member).unwrap();
+        fs::write(member.join("package.json"), r#"{"name":"web"}"#).unwrap();
+
+        let project = ProjectInfo::load(&member, None).unwrap();
+        assert_eq!(project.pm, Pm::Yarn);
+        assert!(project.yarn_berry);
+        assert_eq!(project.cwd, member.canonicalize().unwrap());
+        let workspace = project.workspace.unwrap();
+        assert_eq!(workspace.member, "packages/web");
+        assert_eq!(workspace.root, root.canonicalize().unwrap());
+
+        // The root's packageManager field beats its lockfiles; the member's
+        // own field beats the root's.
+        fs::write(
+            root.join("package.json"),
+            r#"{"workspaces":["packages/*"],"packageManager":"pnpm@9.0.0"}"#,
+        )
+        .unwrap();
+        assert_eq!(ProjectInfo::load(&member, None).unwrap().pm, Pm::Pnpm);
+        fs::write(
+            member.join("package.json"),
+            r#"{"name":"web","packageManager":"bun@1.2.0"}"#,
+        )
+        .unwrap();
+        assert_eq!(ProjectInfo::load(&member, None).unwrap().pm, Pm::Bun);
+        assert_eq!(
+            ProjectInfo::load(&member, Some(Pm::Npm)).unwrap().pm,
+            Pm::Npm
+        );
+
+        // At the root itself there is no member to show.
+        let project = ProjectInfo::load(root, None).unwrap();
+        assert_eq!(project.pm, Pm::Pnpm);
+        assert!(project.workspace.is_none());
+    }
+
+    #[test]
+    fn standalone_projects_detect_from_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir(root.join(".git")).unwrap();
+        fs::write(root.join("yarn.lock"), "").unwrap();
+        let nested = root.join("nested");
+        fs::create_dir(&nested).unwrap();
+        fs::write(nested.join("package.json"), "{}").unwrap();
+        // Without a workspace declaration a parent lockfile is not used.
+        let project = ProjectInfo::load(&nested, None).unwrap();
+        assert_eq!(project.pm, Pm::Npm);
+        assert!(project.workspace.is_none());
     }
 
     #[test]

@@ -1,6 +1,11 @@
-//! Reading the Node.js project on disk: `package.json` and `node_modules`.
+//! Reading the Node.js project on disk: `package.json`, `node_modules`, and
+//! the enclosing workspace root.
 
-use std::{collections::HashMap, fs, path::Path};
+use std::{
+    collections::HashMap,
+    fs,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -69,9 +74,107 @@ pub fn installed_version(cwd: &Path, package: &str) -> Option<String> {
     })
 }
 
+/// Nearest directory at or above `cwd` that declares a workspace: it has a
+/// `pnpm-workspace.yaml`, or its `package.json` has a `workspaces` array or
+/// `{ "packages": [...] }` object. The search stops after the first directory
+/// containing `.git`, so it never leaves the repository.
+pub fn find_workspace_root(cwd: &Path) -> Option<PathBuf> {
+    for dir in cwd.ancestors() {
+        if is_workspace_root(dir) {
+            return Some(dir.to_path_buf());
+        }
+        if dir.join(".git").exists() {
+            break;
+        }
+    }
+    None
+}
+
+fn is_workspace_root(dir: &Path) -> bool {
+    if dir.join("pnpm-workspace.yaml").is_file() {
+        return true;
+    }
+    let Ok(bytes) = fs::read(dir.join("package.json")) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+        return false;
+    };
+    match value.get("workspaces") {
+        Some(Value::Array(_)) => true,
+        Some(Value::Object(fields)) => fields.get("packages").is_some_and(Value::is_array),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_root_is_found_from_members() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // Keep the search inside the temp dir.
+        fs::create_dir(root.join(".git")).unwrap();
+        let member = root.join("packages/web");
+        fs::create_dir_all(&member).unwrap();
+        fs::write(member.join("package.json"), r#"{"name":"web"}"#).unwrap();
+        assert_eq!(find_workspace_root(&member), None);
+
+        fs::write(
+            root.join("pnpm-workspace.yaml"),
+            "packages:\n  - packages/*\n",
+        )
+        .unwrap();
+        assert_eq!(find_workspace_root(&member).as_deref(), Some(root));
+        assert_eq!(find_workspace_root(root).as_deref(), Some(root));
+        fs::remove_file(root.join("pnpm-workspace.yaml")).unwrap();
+
+        fs::write(
+            root.join("package.json"),
+            r#"{"workspaces":["packages/*"]}"#,
+        )
+        .unwrap();
+        assert_eq!(find_workspace_root(&member).as_deref(), Some(root));
+
+        fs::write(
+            root.join("package.json"),
+            r#"{"workspaces":{"packages":["packages/*"],"nohoist":[]}}"#,
+        )
+        .unwrap();
+        assert_eq!(find_workspace_root(&member).as_deref(), Some(root));
+
+        for manifest in [
+            r#"{"workspaces":{"nohoist":[]}}"#,
+            r#"{"workspaces":"packages/*"}"#,
+            "{",
+        ] {
+            fs::write(root.join("package.json"), manifest).unwrap();
+            assert_eq!(find_workspace_root(&member), None, "{manifest}");
+        }
+    }
+
+    #[test]
+    fn workspace_search_stops_at_repository_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let outer = dir.path();
+        fs::create_dir(outer.join(".git")).unwrap();
+        fs::write(outer.join("package.json"), r#"{"workspaces":["*"]}"#).unwrap();
+        let repo = outer.join("repo");
+        let member = repo.join("packages/web");
+        fs::create_dir_all(&member).unwrap();
+        assert_eq!(find_workspace_root(&member).as_deref(), Some(outer));
+
+        // Worktrees and submodules have a `.git` file rather than a directory.
+        fs::write(repo.join(".git"), "gitdir: elsewhere\n").unwrap();
+        assert_eq!(find_workspace_root(&member), None);
+        fs::write(repo.join("pnpm-workspace.yaml"), "").unwrap();
+        assert_eq!(
+            find_workspace_root(&member).as_deref(),
+            Some(repo.as_path())
+        );
+    }
 
     #[test]
     fn installed_version_walks_up_and_rejects_traversal() {
