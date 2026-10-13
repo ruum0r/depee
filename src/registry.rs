@@ -1,9 +1,16 @@
-//! npm Registry client: package documents (cached on disk) and download counts.
+//! npm Registry client: package metadata (parsed, cached on disk) and download counts.
 
-use std::{collections::HashMap, fs, path::PathBuf, sync::OnceLock, time::Duration};
+use std::{
+    collections::HashMap,
+    fs,
+    path::{Path, PathBuf},
+    sync::OnceLock,
+    time::Duration,
+};
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
@@ -31,8 +38,12 @@ fn client() -> Result<&'static reqwest::Client> {
 pub async fn fetch_metadata(name: &str) -> Result<Metadata> {
     let client = client()?;
     let encoded = name.replace('/', "%2f");
-    let doc = match read_cached(name) {
-        Some(doc) => doc,
+    let path = cache_path(name);
+    let cached = path
+        .as_deref()
+        .and_then(|path| read_cached(path, Utc::now()));
+    let mut metadata = match cached {
+        Some(metadata) => metadata,
         None => {
             let doc: Value = client
                 .get(format!("https://registry.npmjs.org/{encoded}"))
@@ -41,46 +52,78 @@ pub async fn fetch_metadata(name: &str) -> Result<Metadata> {
                 .error_for_status()?
                 .json()
                 .await?;
-            write_cache(name, &doc)?;
-            doc
+            let metadata = parse_document(&doc, None);
+            if let Some(path) = &path {
+                write_cache(path, &metadata, Utc::now())?;
+            }
+            metadata
         }
     };
-    // Download counts are a nice-to-have; failures leave them unknown.
-    let downloads = match client
+    metadata.downloads = fetch_downloads(client, &encoded).await;
+    Ok(metadata)
+}
+
+/// Download counts are a nice-to-have; failures leave them unknown.
+async fn fetch_downloads(client: &reqwest::Client, encoded: &str) -> Option<u64> {
+    let response = client
         .get(format!(
             "https://api.npmjs.org/downloads/point/last-week/{encoded}"
         ))
         .send()
         .await
-    {
-        Ok(response) => response
-            .json::<Value>()
-            .await
-            .ok()
-            .and_then(|v| v.get("downloads").and_then(Value::as_u64)),
-        Err(_) => None,
-    };
-    Ok(parse_document(&doc, downloads))
+        .ok()?;
+    response
+        .json::<Value>()
+        .await
+        .ok()?
+        .get("downloads")
+        .and_then(Value::as_u64)
 }
 
 fn cache_path(name: &str) -> Option<PathBuf> {
     cache::dir().map(|dir| dir.join(format!("{}.json", name.replace('/', "_").replace('@', ""))))
 }
 
-fn read_cached(name: &str) -> Option<Value> {
-    let bytes = fs::read(cache_path(name)?).ok()?;
-    let (doc, fetched_at) = serde_json::from_slice::<(Value, DateTime<Utc>)>(&bytes).ok()?;
-    (Utc::now().signed_duration_since(fetched_at).num_hours() < CACHE_TTL_HOURS).then_some(doc)
+/// Bump when the cached `Metadata` changes meaning, so older entries are
+/// refetched. Files from before versioning (raw registry documents stored as
+/// `[document, fetched_at]`) fail to deserialize and are refetched too.
+const CACHE_FORMAT: u32 = 1;
+
+/// On-disk cache entry: parsed metadata without download counts.
+#[derive(Serialize, Deserialize)]
+struct CacheEntry<M> {
+    format: u32,
+    fetched_at: DateTime<Utc>,
+    metadata: M,
+}
+
+/// Fresh metadata at `path`, or `None` when the entry is missing, unreadable,
+/// from another format, or older than the TTL.
+fn read_cached(path: &Path, now: DateTime<Utc>) -> Option<Metadata> {
+    let bytes = fs::read(path).ok()?;
+    let entry = serde_json::from_slice::<CacheEntry<Metadata>>(&bytes).ok()?;
+    let fresh = entry.format == CACHE_FORMAT
+        && now.signed_duration_since(entry.fetched_at).num_hours() < CACHE_TTL_HOURS;
+    // Download counts are never served from this cache.
+    fresh.then_some(Metadata {
+        downloads: None,
+        ..entry.metadata
+    })
 }
 
 /// The cache is best effort; only serialization failures are reported.
-fn write_cache(name: &str, doc: &Value) -> Result<()> {
-    if let Some(path) = cache_path(name) {
-        if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        let _ = fs::write(path, serde_json::to_vec(&(doc, Utc::now()))?);
+/// Callers pass metadata parsed without download counts.
+fn write_cache(path: &Path, metadata: &Metadata, now: DateTime<Utc>) -> Result<()> {
+    let entry = CacheEntry {
+        format: CACHE_FORMAT,
+        fetched_at: now,
+        metadata,
+    };
+    let bytes = serde_json::to_vec(&entry)?;
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
     }
+    let _ = fs::write(path, bytes);
     Ok(())
 }
 
@@ -226,6 +269,94 @@ mod tests {
         assert_eq!(latest.deprecated.as_deref(), Some("use lib2"));
         assert!(metadata.releases[1].prerelease);
         assert_eq!(metadata.releases[2].license.as_deref(), Some("ISC"));
+    }
+
+    fn sample_document() -> Value {
+        json!({
+            "description": "A lib",
+            "dist-tags": {"latest": "2.0.0"},
+            "time": {"1.0.0": "2024-01-01T00:00:00Z", "2.0.0": "2025-01-01T00:00:00Z"},
+            "versions": {
+                "1.0.0": {"license": "ISC"},
+                "2.0.0": {
+                    "license": "MIT",
+                    "engines": {"node": ">=18"},
+                    "dependencies": {"a": "^1.0.0"},
+                    "peerDependencies": {"react": "^19.0.0"}
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn cache_round_trips_metadata_without_downloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("lib.json");
+        let now = Utc::now();
+        write_cache(&path, &parse_document(&sample_document(), Some(42)), now).unwrap();
+
+        let metadata = read_cached(&path, now).unwrap();
+        assert_eq!(metadata.description.as_deref(), Some("A lib"));
+        assert_eq!(metadata.license.as_deref(), Some("MIT"));
+        assert_eq!(metadata.downloads, None);
+        assert_eq!(
+            metadata.published.map(|d| d.to_rfc3339()).as_deref(),
+            Some("2025-01-01T00:00:00+00:00")
+        );
+        let versions: Vec<_> = metadata.releases.iter().map(|r| &r.version[..]).collect();
+        assert_eq!(versions, ["2.0.0", "1.0.0"]);
+        let latest = &metadata.releases[0];
+        assert_eq!(latest.change, Change::Unknown);
+        assert_eq!(latest.dependencies, ["a"]);
+        assert_eq!(latest.dependency_specs.peer["react"], "^19.0.0");
+        assert_eq!(latest.engines_node.as_deref(), Some(">=18"));
+        assert_eq!(metadata.releases[1].license.as_deref(), Some("ISC"));
+    }
+
+    #[test]
+    fn expired_cache_entry_is_a_miss() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lib.json");
+        let fetched_at = Utc::now();
+        write_cache(&path, &parse_document(&sample_document(), None), fetched_at).unwrap();
+
+        let hours = |h| fetched_at + chrono::Duration::hours(h);
+        assert!(read_cached(&path, hours(CACHE_TTL_HOURS - 1)).is_some());
+        assert!(read_cached(&path, hours(CACHE_TTL_HOURS)).is_none());
+    }
+
+    #[test]
+    fn legacy_document_cache_is_a_miss_and_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lib.json");
+        let now = Utc::now();
+        let legacy = serde_json::to_vec(&(sample_document(), now)).unwrap();
+        fs::write(&path, legacy).unwrap();
+        assert!(read_cached(&path, now).is_none());
+
+        write_cache(&path, &parse_document(&sample_document(), None), now).unwrap();
+        assert!(read_cached(&path, now).is_some());
+    }
+
+    #[test]
+    fn corrupt_or_unknown_format_cache_is_a_miss() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lib.json");
+        let now = Utc::now();
+        assert!(read_cached(&path, now).is_none());
+
+        write_cache(&path, &parse_document(&sample_document(), None), now).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        fs::write(&path, &bytes[..bytes.len() / 2]).unwrap();
+        assert!(read_cached(&path, now).is_none());
+
+        fs::write(&path, b"not json").unwrap();
+        assert!(read_cached(&path, now).is_none());
+
+        let mut entry: Value = serde_json::from_slice(&bytes).unwrap();
+        entry["format"] = json!(CACHE_FORMAT + 1);
+        fs::write(&path, serde_json::to_vec(&entry).unwrap()).unwrap();
+        assert!(read_cached(&path, now).is_none());
     }
 
     #[test]
