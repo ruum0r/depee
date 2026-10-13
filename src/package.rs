@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -12,7 +13,7 @@ pub enum Kind {
 }
 
 /// Size of the semver jump between two versions.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Change {
     Patch,
     Minor,
@@ -68,7 +69,7 @@ pub fn clean_spec(s: &str) -> &str {
     s.trim_start_matches(['v', '^', '~', '='])
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct DependencySpecs {
     pub dependencies: HashMap<String, String>,
     pub peer: HashMap<String, String>,
@@ -85,7 +86,7 @@ impl DependencySpecs {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Release {
     pub version: String,
     pub published: Option<DateTime<Utc>>,
@@ -100,7 +101,7 @@ pub struct Release {
 }
 
 /// npm Registry data for one package.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Metadata {
     pub description: Option<String>,
     pub license: Option<String>,
