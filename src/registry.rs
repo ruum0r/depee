@@ -40,7 +40,10 @@ pub async fn fetch_metadata(name: &str) -> Result<Metadata> {
     let encoded = name.replace('/', "%2f");
     let path = cache_path(name);
     let now = Utc::now();
-    let cached = path.as_deref().and_then(|path| read_cached(path, now));
+    let cached = match path.clone() {
+        Some(path) => blocking(move || read_cached(&path, now)).await?,
+        None => None,
+    };
     match plan(cached) {
         Plan::Cached(metadata) => Ok(metadata),
         Plan::Downloads(entry) => {
@@ -50,23 +53,43 @@ pub async fn fetch_metadata(name: &str) -> Result<Metadata> {
                 ..entry.metadata
             };
             // Keep the original fetch time so the entry still expires on schedule.
-            if let (Some(_), Some(path)) = (downloads, &path) {
-                write_cache(path, &metadata, entry.fetched_at)?;
+            match (downloads, path) {
+                (Some(_), Some(path)) => {
+                    blocking(move || {
+                        write_cache(&path, &metadata, entry.fetched_at).map(|()| metadata)
+                    })
+                    .await?
+                }
+                _ => Ok(metadata),
             }
-            Ok(metadata)
         }
         Plan::Everything => {
             let (doc, downloads) = tokio::join!(
                 fetch_document(client, &encoded),
                 fetch_downloads(client, &encoded)
             );
-            let metadata = parse_document(&doc?, downloads);
-            if let Some(path) = &path {
-                write_cache(path, &metadata, now)?;
-            }
-            Ok(metadata)
+            let body = doc?;
+            blocking(move || {
+                let doc = serde_json::from_slice::<Value>(body.as_ref())?;
+                let metadata = parse_document(&doc, downloads);
+                if let Some(path) = &path {
+                    write_cache(path, &metadata, now)?;
+                }
+                Ok(metadata)
+            })
+            .await?
         }
     }
+}
+
+/// Runs file I/O and JSON (de)serialization off the async runtime. A panic
+/// or cancellation in the closure comes back as an error.
+async fn blocking<T, F>(f: F) -> Result<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    Ok(tokio::task::spawn_blocking(f).await?)
 }
 
 /// What `fetch_metadata` still has to request, given the fresh cache entry.
@@ -89,13 +112,18 @@ fn plan(cached: Option<CacheEntry<Metadata>>) -> Plan {
     }
 }
 
-async fn fetch_document(client: &reqwest::Client, encoded: &str) -> Result<Value> {
+/// The raw document body; parsing it is CPU-heavy, so the caller does it
+/// on a blocking thread.
+async fn fetch_document(
+    client: &reqwest::Client,
+    encoded: &str,
+) -> Result<impl AsRef<[u8]> + Send + 'static> {
     Ok(client
         .get(format!("https://registry.npmjs.org/{encoded}"))
         .send()
         .await?
         .error_for_status()?
-        .json()
+        .bytes()
         .await?)
 }
 
@@ -255,6 +283,12 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[tokio::test]
+    async fn blocking_turns_a_panic_into_an_error() {
+        assert_eq!(blocking(|| 7).await.unwrap(), 7);
+        assert!(blocking(|| panic!("boom")).await.is_err());
+    }
 
     #[test]
     fn reuses_one_client() {

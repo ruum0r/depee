@@ -22,8 +22,9 @@ use crate::{
     project::{self, Manifest},
 };
 
-/// Registry metadata requests running at once.
-const METADATA_CONCURRENCY: usize = 4;
+/// Registry metadata requests running at once. They share one HTTP client
+/// and its connection pool.
+const METADATA_CONCURRENCY: usize = 8;
 
 /// Facts about the inspected project and its toolchain.
 pub struct ProjectInfo {
