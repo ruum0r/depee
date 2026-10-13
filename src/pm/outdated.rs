@@ -104,12 +104,10 @@ async fn outdated_json(cwd: &Path, pm: Pm, args: &[&str]) -> Result<Value> {
         Value::Null
     } else if pm == Pm::Yarn {
         // Yarn Classic prints one JSON document per line.
-        Value::Array(
-            String::from_utf8_lossy(&out.stdout)
-                .lines()
-                .filter_map(|line| serde_json::from_str(line).ok())
-                .collect(),
-        )
+        super::yarn_output::parse_ndjson(
+            &String::from_utf8_lossy(&out.stdout),
+            !out.status.success(),
+        )?
     } else {
         serde_json::from_slice(&out.stdout)
             .with_context(|| format!("Invalid JSON from {command}"))?

@@ -135,6 +135,9 @@ only after confirmation.
 - `outdated` output formats vary between package manager releases. npm and
   Bun's JSON output and the common pnpm/Yarn JSON forms are supported; unusual
   CLI output may need parser adjustments.
+- Yarn Berry (2+) has no built-in `outdated` command, so depee cannot list
+  outdated packages for Yarn 2+ projects yet and reports an error instead.
+  Updates through `yarn up` are still supported.
 - Yarn Plug'n'Play is not managed as a separate project model.
 - Workspaces are inspected one member at a time (switch with `w` or
   `--workspace`); there is no combined view of all members.
