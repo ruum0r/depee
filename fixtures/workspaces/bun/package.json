@@ -1,0 +1,1 @@
+{ "name": "fx-bun", "private": true, "workspaces": ["packages/*"], "devDependencies": { "kleur": "^3.0.0" } }

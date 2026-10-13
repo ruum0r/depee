@@ -1,0 +1,1 @@
+{ "name": "fx-yarn-classic", "private": true, "packageManager": "yarn@1.22.22", "workspaces": ["packages/*"], "devDependencies": { "kleur": "^3.0.0" } }

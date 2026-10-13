@@ -1,0 +1,11 @@
+{
+  "name": "fx-yarn-berry",
+  "private": true,
+  "packageManager": "yarn@4.10.3",
+  "workspaces": [
+    "packages/*"
+  ],
+  "devDependencies": {
+    "kleur": "^3.0.0"
+  }
+}

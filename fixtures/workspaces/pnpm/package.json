@@ -1,0 +1,1 @@
+{ "name": "fx-pnpm", "private": true, "packageManager": "pnpm@11.10.0", "devDependencies": { "kleur": "^3.0.0" } }
