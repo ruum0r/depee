@@ -9,6 +9,7 @@ mod project;
 mod registry;
 mod self_update;
 mod ui;
+mod workspace;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -28,9 +29,14 @@ async fn main() -> Result<()> {
     if cli.clear_cache {
         return cache::clear();
     }
-    let project = ProjectInfo::load(&cli.cwd, cli.pm)?;
+    let mut project = ProjectInfo::load(&cli.cwd, cli.pm)?;
+    if let Some(query) = &cli.workspace {
+        project = project.select_member(query)?;
+    }
+    // At a workspace root, choose a member before scanning.
+    let pick_workspace = cli.workspace.is_none() && project.at_workspace_root_with_members();
     let (mut app, rx) = App::new(project);
-    app.start();
+    app.start(pick_workspace);
 
     let mut terminal = ratatui::init();
     let result = run(&mut terminal, &mut app, rx).await;

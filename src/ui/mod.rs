@@ -5,6 +5,7 @@ mod details;
 mod list;
 mod text;
 mod update_prompt;
+mod workspace;
 
 use ratatui::{
     layout::{Constraint, Layout, Rect},
@@ -63,7 +64,10 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     let member = project
         .workspace
         .as_ref()
-        .map(|workspace| format!(" (workspace: {})", workspace.member))
+        .map(|workspace| match workspace.member.as_str() {
+            "" => " (workspace: root)".to_string(),
+            member => format!(" (workspace: {member})"),
+        })
         .unwrap_or_default();
     f.render_widget(
         Paragraph::new(format!(
@@ -80,9 +84,10 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_content(f: &mut Frame, app: &App, area: Rect) {
-    if let Mode::Confirm(_) = app.mode {
-        confirm::draw(f, app, area);
-        return;
+    match &app.mode {
+        Mode::Confirm(_) => return confirm::draw(f, app, area),
+        Mode::WorkspacePicker(picker) => return workspace::draw(f, app, picker, area),
+        _ => {}
     }
     let [list_area, details_area] = if area.width >= WIDE_LAYOUT_WIDTH {
         Layout::horizontal([Constraint::Percentage(62), Constraint::Percentage(38)]).areas(area)
@@ -136,13 +141,33 @@ fn footer_hints(app: &App) -> [Line<'static>; 2] {
             )),
             Line::from("↑/↓ or Ctrl+n/p moves through matching packages."),
         ],
-        Mode::Browse => [
-            Line::from("↑↓ j/k Move · Enter Details · / Search · s Sort · v Versions · u Update"),
+        Mode::WorkspacePicker(picker) => [
+            Line::from(if picker.startup {
+                "↑/↓ or j/k select member · Enter inspect · Esc use root · q quit"
+            } else {
+                "↑/↓ or j/k select member · Enter switch · Esc cancel"
+            }),
             Line::from(format!(
-                "S Reverse · c Changelog · r Refresh · q Quit │ {}",
+                "Scans and updates run in the chosen member. │ {}",
                 app.status
             )),
         ],
+        Mode::Browse => {
+            let workspace = if app.project.workspace.is_some() {
+                "w Workspace · "
+            } else {
+                ""
+            };
+            [
+                Line::from(
+                    "↑↓ j/k Move · Enter Details · / Search · s Sort · v Versions · u Update",
+                ),
+                Line::from(format!(
+                    "S Reverse · c Changelog · r Refresh · {workspace}q Quit │ {}",
+                    app.status
+                )),
+            ]
+        }
     }
 }
 
@@ -150,10 +175,13 @@ fn footer_hints(app: &App) -> [Line<'static>; 2] {
 mod tests {
     use ratatui::{backend::TestBackend, Terminal};
 
+    use std::path::PathBuf;
+
     use super::*;
     use crate::{
         app::{fixtures::app, MetadataStatus, UpdatePrompt, Workspace},
         package::fixtures::{package, release},
+        workspace::Member,
     };
 
     fn render(app: &App, width: u16, height: u16) -> String {
@@ -199,11 +227,54 @@ mod tests {
     fn header_shows_the_workspace_member() {
         let mut app = loaded_app();
         assert!(!render(&app, 120, 30).contains("workspace:"));
-        app.project.workspace = Some(Workspace {
-            root: "/repo".into(),
-            member: "packages/web".into(),
-        });
-        assert!(render(&app, 120, 30).contains(" depee · test (workspace: packages/web) · npm "));
+        app.project.workspace = Some(workspace("packages/web"));
+        let screen = render(&app, 120, 30);
+        assert!(screen.contains(" depee · test (workspace: packages/web) · npm "));
+        assert!(screen.contains("w Workspace · q Quit"));
+        app.project.workspace = Some(workspace(""));
+        assert!(render(&app, 120, 30).contains(" depee · test (workspace: root) · npm "));
+    }
+
+    fn workspace(member: &str) -> Workspace {
+        let member_at = |path: &str, name: Option<&str>| Member {
+            dir: PathBuf::from("repo").join(path),
+            path: path.into(),
+            name: name.map(str::to_string),
+        };
+        Workspace {
+            root: "repo".into(),
+            member: member.into(),
+            members: vec![
+                member_at("", Some("mono")),
+                member_at("packages/api", None),
+                member_at("packages/web", Some("web")),
+            ],
+        }
+    }
+
+    #[test]
+    fn workspace_picker_lists_members() {
+        let mut app = loaded_app();
+        app.project.workspace = Some(workspace("packages/web"));
+        app.open_workspace_picker(false);
+        for (width, height) in [(160, 50), (80, 24), (50, 12)] {
+            let screen = render(&app, width, height);
+            assert!(screen.contains("WORKSPACE MEMBERS · 3"), "{screen}");
+            // The selected row stays visible even when the list is cut.
+            assert!(screen.contains("❯ ● packages/web"), "{screen}");
+            assert!(!screen.contains("PACKAGES"));
+        }
+        let screen = render(&app, 80, 24);
+        assert!(screen.contains("Enter switch · Esc cancel"));
+        assert!(screen.contains("(root)"));
+        assert!(screen.contains("mono"));
+        assert!(screen.contains("packages/api"));
+        assert!(screen.contains("N/A"));
+        // The current member is selected and marked.
+        let selected = screen.lines().find(|l| l.contains("❯")).unwrap();
+        assert!(selected.contains("● packages/web") && selected.contains("web"));
+        app.open_workspace_picker(true);
+        assert!(render(&app, 80, 24).contains("Esc use root"));
     }
 
     #[test]

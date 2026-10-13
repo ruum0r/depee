@@ -6,20 +6,43 @@ use crate::{
     pm::{self, Pm, ScanResult},
 };
 
+/// Results of background work. The `u64` is the `App::epoch` the task was
+/// started in; results from an earlier epoch belong to another workspace
+/// member and are dropped.
 pub enum Msg {
-    Scan(Result<ScanResult, String>),
-    Metadata(usize, Result<Metadata, String>),
-    PmVersion(String),
+    Scan(u64, Result<ScanResult, String>),
+    Metadata(u64, usize, Result<Metadata, String>),
+    PmVersion(u64, String),
     NodeVersion(String),
-    Update(Result<String, String>),
+    Update(u64, Result<String, String>),
+}
+
+impl Msg {
+    fn epoch(&self) -> Option<u64> {
+        match self {
+            Self::Scan(epoch, _)
+            | Self::Metadata(epoch, ..)
+            | Self::PmVersion(epoch, _)
+            | Self::Update(epoch, _) => Some(*epoch),
+            Self::NodeVersion(_) => None,
+        }
+    }
 }
 
 impl App {
     pub fn handle_message(&mut self, msg: Msg) {
+        if msg.epoch().is_some_and(|epoch| epoch != self.epoch) {
+            // Switching is refused while updating, so no update should end
+            // up here; if one does, do not leave the app stuck in UPDATING.
+            if let Msg::Update(..) = msg {
+                self.updating = false;
+            }
+            return;
+        }
         match msg {
-            Msg::Scan(result) => self.on_scan(result),
-            Msg::Metadata(index, result) => self.on_metadata(index, result),
-            Msg::PmVersion(version) => {
+            Msg::Scan(_, result) => self.on_scan(result),
+            Msg::Metadata(_, index, result) => self.on_metadata(index, result),
+            Msg::PmVersion(_, version) => {
                 if self.project.pm == Pm::Yarn {
                     if let Some(major) = pm::yarn_major(&version) {
                         self.project.yarn_berry = major >= 2;
@@ -28,7 +51,7 @@ impl App {
                 self.project.pm_version = version;
             }
             Msg::NodeVersion(version) => self.project.node_version = version,
-            Msg::Update(result) => {
+            Msg::Update(_, result) => {
                 self.updating = false;
                 match result {
                     Ok(summary) => {
@@ -116,10 +139,13 @@ mod tests {
         let mut app = app();
         app.loading = true;
         app.selected = 5;
-        app.handle_message(Msg::Scan(Ok(ScanResult {
-            packages: vec![package(), package()],
-            warning: Some("stale".into()),
-        })));
+        app.handle_message(Msg::Scan(
+            0,
+            Ok(ScanResult {
+                packages: vec![package(), package()],
+                warning: Some("stale".into()),
+            }),
+        ));
         assert!(!app.loading);
         assert_eq!(app.selected, 1);
         assert_eq!(app.status, "2 outdated · warning: press e for details");
@@ -131,7 +157,7 @@ mod tests {
             .all(|status| matches!(status, MetadataStatus::Loading)));
         assert_eq!(app.metadata.len(), 2);
 
-        app.handle_message(Msg::Scan(Err("npm exploded".into())));
+        app.handle_message(Msg::Scan(0, Err("npm exploded".into())));
         assert_eq!(app.status, "npm exploded");
         assert_eq!(app.packages.len(), 2);
     }
@@ -141,10 +167,10 @@ mod tests {
         let mut app = app();
         app.packages = vec![package()];
         app.metadata.insert(0, MetadataStatus::Loading);
-        app.handle_message(Msg::Metadata(0, Err("timed out".into())));
+        app.handle_message(Msg::Metadata(0, 0, Err("timed out".into())));
         assert_eq!(app.selected_metadata_error(), Some("timed out"));
 
-        app.handle_message(Msg::Metadata(0, Ok(metadata())));
+        app.handle_message(Msg::Metadata(0, 0, Ok(metadata())));
         assert_eq!(app.selected_metadata_error(), None);
         assert_eq!(app.packages[0].releases.len(), 1);
     }
@@ -154,17 +180,20 @@ mod tests {
         let mut app = app();
         app.updating = true;
         app.error = Some("old".into());
-        app.handle_message(Msg::Update(Ok("npm update lib succeeded".into())));
+        app.handle_message(Msg::Update(0, Ok("npm update lib succeeded".into())));
         assert!(!app.updating);
         assert!(app.loading);
         assert_eq!(app.error, None);
-        app.handle_message(Msg::Scan(Ok(ScanResult {
-            packages: vec![],
-            warning: None,
-        })));
+        app.handle_message(Msg::Scan(
+            0,
+            Ok(ScanResult {
+                packages: vec![],
+                warning: None,
+            }),
+        ));
         assert_eq!(app.status, "npm update lib succeeded");
 
-        app.handle_message(Msg::Update(Err("EACCES".into())));
+        app.handle_message(Msg::Update(0, Err("EACCES".into())));
         assert_eq!(app.status, "Update failed · press e for error");
         assert_eq!(app.error.as_deref(), Some("EACCES"));
     }
@@ -173,11 +202,11 @@ mod tests {
     fn yarn_version_decides_berry() {
         let mut app = app();
         app.project.pm = Pm::Yarn;
-        app.handle_message(Msg::PmVersion("4.1.0".into()));
+        app.handle_message(Msg::PmVersion(0, "4.1.0".into()));
         assert!(app.project.yarn_berry);
-        app.handle_message(Msg::PmVersion("1.22.22".into()));
+        app.handle_message(Msg::PmVersion(0, "1.22.22".into()));
         assert!(!app.project.yarn_berry);
-        app.handle_message(Msg::PmVersion("N/A".into()));
+        app.handle_message(Msg::PmVersion(0, "N/A".into()));
         assert!(!app.project.yarn_berry);
         assert_eq!(app.project.pm_version, "N/A");
     }

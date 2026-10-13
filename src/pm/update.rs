@@ -71,6 +71,7 @@ fn update_args(pm: Pm, request: &UpdateRequest) -> Vec<String> {
 
 /// Runs the update and describes what ended up installed.
 pub async fn run_update(cwd: &Path, pm: Pm, request: &UpdateRequest) -> Result<String, String> {
+    check_name(&request.name)?;
     let command = request.command_line(pm);
     let mut cmd = Command::new(pm.name());
     cmd.current_dir(cwd)
@@ -111,9 +112,26 @@ pub async fn run_update(cwd: &Path, pm: Pm, request: &UpdateRequest) -> Result<S
     })
 }
 
+/// Names come from the package manager's output; one starting with `-` would
+/// be read as an option.
+fn check_name(name: &str) -> Result<(), String> {
+    if name.is_empty() || name.starts_with('-') {
+        return Err(format!("Refusing to update invalid package name: {name:?}"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn names_that_look_like_options_are_refused() {
+        assert!(check_name("@scope/lib").is_ok());
+        assert!(check_name("lodash").is_ok());
+        assert!(check_name("--global").is_err());
+        assert!(check_name("").is_err());
+    }
 
     fn request(target: &str, upgrade: bool, yarn_berry: bool) -> UpdateRequest {
         UpdateRequest {

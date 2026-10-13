@@ -20,6 +20,7 @@ use crate::{
     package::Package,
     pm::{self, Pm, UpdateRequest},
     project::{self, Manifest},
+    workspace::{self, Member},
 };
 
 /// Registry metadata requests running at once. They share one HTTP client
@@ -36,16 +37,27 @@ pub struct ProjectInfo {
     pub node_version: String,
     /// Declared dependencies, outdated or not.
     pub total: usize,
-    /// Set when `cwd` is a member below a workspace root.
+    /// Set when `cwd` is the root or a member of a workspace.
     pub workspace: Option<Workspace>,
+    /// The `--pm` flag, kept for switching members.
+    pub pm_override: Option<Pm>,
 }
 
-/// The workspace enclosing a member project. Package manager detection uses
-/// its root; scans and updates still run in the member directory.
+/// The workspace enclosing the project. Package manager detection uses its
+/// root; scans and updates still run in the member directory.
 pub struct Workspace {
     pub root: PathBuf,
-    /// The member directory relative to `root`, `/`-separated.
+    /// The member directory relative to `root`, `/`-separated; empty at the root.
     pub member: String,
+    /// The root and its members, as listed in the workspace picker.
+    pub members: Vec<Member>,
+}
+
+impl Workspace {
+    /// Index of the current member in `members`, if it is listed.
+    pub fn current(&self) -> Option<usize> {
+        self.members.iter().position(|m| m.path == self.member)
+    }
 }
 
 impl ProjectInfo {
@@ -53,15 +65,50 @@ impl ProjectInfo {
         let cwd = cwd
             .canonicalize()
             .with_context(|| format!("Project directory not found: {}", cwd.display()))?;
+        let workspace = project::find_workspace_root(&cwd).map(|root| {
+            let members = workspace::members(&root);
+            (root, members)
+        });
+        Self::load_in(cwd, workspace, pm_override)
+    }
+
+    /// The same workspace with `member` as the project. Detection follows
+    /// `load`, so the member's own `packageManager` field still wins.
+    pub fn switch_to(&self, member: &Member) -> Result<Self> {
+        let workspace = self.workspace.as_ref().context("Not inside a workspace")?;
+        // The directory may have changed since the members were listed.
+        let cwd = member
+            .dir
+            .canonicalize()
+            .with_context(|| format!("Workspace member not found: {}", member.label()))?;
+        anyhow::ensure!(
+            cwd.starts_with(&workspace.root),
+            "Workspace member is outside the workspace root: {}",
+            member.label()
+        );
+        let members = (workspace.root.clone(), workspace.members.clone());
+        Self::load_in(cwd, Some(members), self.pm_override)
+    }
+
+    /// `cwd` must be canonical; `workspace` is its root and members.
+    fn load_in(
+        cwd: PathBuf,
+        workspace: Option<(PathBuf, Vec<Member>)>,
+        pm_override: Option<Pm>,
+    ) -> Result<Self> {
         let manifest = Manifest::read(&cwd)?;
-        let workspace = project::find_workspace_root(&cwd).and_then(|root| {
+        let workspace = workspace.and_then(|(root, members)| {
             let member = cwd.strip_prefix(&root).ok()?;
             let member = member
                 .iter()
                 .map(|part| part.to_string_lossy())
                 .collect::<Vec<_>>()
                 .join("/");
-            (!member.is_empty()).then_some(Workspace { root, member })
+            Some(Workspace {
+                root,
+                member,
+                members,
+            })
         });
         // Lockfiles and Yarn settings live in the workspace root. The member's
         // own `packageManager` field wins over the root's.
@@ -75,12 +122,15 @@ impl ProjectInfo {
         let pm = Pm::detect(pm_override, field.as_deref(), pm_dir)?;
         let yarn_berry = pm == Pm::Yarn && pm::detect_yarn_berry(field.as_deref(), pm_dir);
         let total = manifest.dependency_count();
-        let name = manifest.name.unwrap_or_else(|| {
-            cwd.file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("project")
-                .to_owned()
-        });
+        let name = manifest.name.as_deref().map_or_else(
+            || {
+                cwd.file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("project")
+                    .to_owned()
+            },
+            workspace::sanitize,
+        );
         Ok(Self {
             cwd,
             name,
@@ -90,7 +140,27 @@ impl ProjectInfo {
             node_version: "checking…".into(),
             total,
             workspace,
+            pm_override,
         })
+    }
+
+    /// The member named by `--workspace` (package name or relative path).
+    pub fn select_member(self, query: &str) -> Result<Self> {
+        let workspace = self.workspace.as_ref().context(
+            "--workspace needs a workspace root (pnpm-workspace.yaml or package.json `workspaces`)",
+        )?;
+        let member = workspace::find(&workspace.members, query).map_err(anyhow::Error::msg)?;
+        if member.path == workspace.member {
+            return Ok(self);
+        }
+        self.switch_to(member)
+    }
+
+    /// At a workspace root that has members to choose from.
+    pub fn at_workspace_root_with_members(&self) -> bool {
+        self.workspace
+            .as_ref()
+            .is_some_and(|w| w.member.is_empty() && w.members.iter().any(|m| !m.is_root()))
     }
 }
 
@@ -102,6 +172,15 @@ pub enum Mode {
     /// Choosing a release of the selected package.
     VersionPicker,
     Confirm(Confirm),
+    /// Choosing the workspace member to inspect.
+    WorkspacePicker(WorkspacePicker),
+}
+
+pub struct WorkspacePicker {
+    /// Index into `Workspace::members`.
+    pub selected: usize,
+    /// Opened at launch, before any scan: cancelling inspects the root.
+    pub startup: bool,
 }
 
 #[derive(Default)]
@@ -195,6 +274,9 @@ pub struct App {
     pub metadata: HashMap<usize, MetadataStatus>,
     // `node_modules` lookups made while drawing; cleared whenever a scan finishes.
     installed_versions: RefCell<HashMap<String, Option<String>>>,
+    /// Bumped whenever another workspace member is chosen. Background results
+    /// carry the epoch they were started in; older ones are dropped.
+    epoch: u64,
     metadata_limit: Arc<Semaphore>,
     tx: mpsc::UnboundedSender<Msg>,
 }
@@ -221,6 +303,7 @@ impl App {
             should_quit: false,
             metadata: HashMap::new(),
             installed_versions: RefCell::default(),
+            epoch: 0,
             metadata_limit: Arc::new(Semaphore::new(METADATA_CONCURRENCY)),
             tx,
         };
@@ -329,6 +412,99 @@ impl App {
         self.mode = Mode::Browse;
     }
 
+    pub fn workspace_picker(&self) -> Option<&WorkspacePicker> {
+        match &self.mode {
+            Mode::WorkspacePicker(picker) => Some(picker),
+            _ => None,
+        }
+    }
+
+    /// Opens the member picker on the current member. Does nothing outside a
+    /// workspace.
+    pub fn open_workspace_picker(&mut self, startup: bool) {
+        let Some(workspace) = &self.project.workspace else {
+            return;
+        };
+        if workspace.members.is_empty() {
+            self.status = "No workspace members found".into();
+            return;
+        }
+        self.mode = Mode::WorkspacePicker(WorkspacePicker {
+            selected: workspace.current().unwrap_or(0),
+            startup,
+        });
+    }
+
+    /// Leaves the picker without switching. At startup nothing was scanned
+    /// yet, so the root is inspected.
+    pub fn cancel_workspace_picker(&mut self) {
+        let root = self
+            .project
+            .workspace
+            .as_ref()
+            .and_then(|w| w.members.iter().position(Member::is_root));
+        let startup = self.workspace_picker().is_some_and(|p| p.startup);
+        match root {
+            Some(root) if startup => self.switch_workspace(root),
+            None if startup => {
+                self.mode = Mode::Browse;
+                self.spawn_scan();
+            }
+            _ => self.mode = Mode::Browse,
+        }
+    }
+
+    /// Makes `members[index]` the project and rescans it. Results still on
+    /// their way for the previous member are dropped by the epoch check.
+    pub fn switch_workspace(&mut self, index: usize) {
+        let Some(picker) = self.workspace_picker() else {
+            return;
+        };
+        let startup = picker.startup;
+        // The running update reports back to the current member's list.
+        if self.updating {
+            self.status = "Wait for the update to finish before switching members".into();
+            return;
+        }
+        let Some(workspace) = &self.project.workspace else {
+            return;
+        };
+        let Some(member) = workspace.members.get(index).cloned() else {
+            return;
+        };
+        self.mode = Mode::Browse;
+        if member.path == workspace.member {
+            if startup {
+                self.spawn_scan();
+            }
+            return;
+        }
+        let project = match self.project.switch_to(&member) {
+            Ok(project) => project,
+            Err(error) => {
+                let error = format!("{error:#}");
+                self.status = error.clone();
+                self.error = Some(error);
+                if startup {
+                    self.spawn_scan();
+                }
+                return;
+            }
+        };
+        let node_version = std::mem::take(&mut self.project.node_version);
+        self.project = project;
+        self.project.node_version = node_version;
+        self.epoch += 1;
+        self.packages.clear();
+        self.selected = 0;
+        self.metadata.clear();
+        self.installed_versions.borrow_mut().clear();
+        self.error = None;
+        self.status_after_refresh = None;
+        self.spawn_scan();
+        self.spawn_pm_version();
+    }
+
     pub fn pinned_version(&self) -> Option<&str> {
         self.confirm().and_then(|confirm| confirm.pinned.as_deref())
     }
@@ -399,6 +575,7 @@ pub mod fixtures {
             node_version: String::new(),
             total: 0,
             workspace: None,
+            pm_override: None,
         };
         App::new(project).0
     }
@@ -538,10 +715,156 @@ mod tests {
             Pm::Npm
         );
 
-        // At the root itself there is no member to show.
+        // At the root itself the member path is empty.
         let project = ProjectInfo::load(root, None).unwrap();
         assert_eq!(project.pm, Pm::Pnpm);
-        assert!(project.workspace.is_none());
+        assert_eq!(project.workspace.unwrap().member, "");
+    }
+
+    /// A root with members `packages/a` (named `a`) and `packages/b`, which
+    /// declares its own package manager.
+    fn workspace_dir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir(root.join(".git")).unwrap();
+        fs::write(
+            root.join("package.json"),
+            r#"{"name":"mono","workspaces":["packages/*"],"dependencies":{"x":"1"}}"#,
+        )
+        .unwrap();
+        fs::write(root.join("package-lock.json"), "{}").unwrap();
+        for (path, manifest) in [
+            (
+                "packages/a",
+                r#"{"name":"a","devDependencies":{"y":"1","z":"1"}}"#,
+            ),
+            (
+                "packages/b",
+                r#"{"name":"b","packageManager":"pnpm@9.0.0"}"#,
+            ),
+        ] {
+            fs::create_dir_all(root.join(path)).unwrap();
+            fs::write(root.join(path).join("package.json"), manifest).unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn members_are_selected_by_name_or_path() {
+        let dir = workspace_dir();
+        let root = dir.path().canonicalize().unwrap();
+        let project = ProjectInfo::load(&root, None).unwrap();
+        assert!(project.at_workspace_root_with_members());
+        let workspace = project.workspace.as_ref().unwrap();
+        let labels: Vec<_> = workspace.members.iter().map(Member::label).collect();
+        assert_eq!(labels, ["(root)", "packages/a", "packages/b"]);
+        assert_eq!(workspace.current(), Some(0));
+
+        let a = ProjectInfo::load(&root, None)
+            .unwrap()
+            .select_member("a")
+            .unwrap();
+        assert_eq!(a.cwd, root.join("packages/a"));
+        assert_eq!((a.name.as_str(), a.total, a.pm), ("a", 2, Pm::Npm));
+        assert!(!a.at_workspace_root_with_members());
+        // The member's own packageManager wins, as in `load`; --pm beats both.
+        let b = a.select_member("packages/b/").unwrap();
+        assert_eq!((b.name.as_str(), b.pm), ("b", Pm::Pnpm));
+        assert_eq!(b.workspace.as_ref().unwrap().member, "packages/b");
+        let forced = ProjectInfo::load(&root, Some(Pm::Bun))
+            .unwrap()
+            .select_member("b")
+            .unwrap();
+        assert_eq!(forced.pm, Pm::Bun);
+        let back = b.select_member(".").unwrap();
+        assert_eq!(back.cwd, root);
+
+        let error = ProjectInfo::load(&root, None)
+            .unwrap()
+            .select_member("c")
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("Unknown workspace member: c"));
+        let standalone = tempfile::tempdir().unwrap();
+        fs::create_dir(standalone.path().join(".git")).unwrap();
+        fs::write(standalone.path().join("package.json"), "{}").unwrap();
+        assert!(ProjectInfo::load(standalone.path(), None)
+            .unwrap()
+            .select_member("a")
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn switching_members_drops_results_for_the_previous_one() {
+        let dir = workspace_dir();
+        let project = ProjectInfo::load(dir.path(), None).unwrap();
+        let (mut app, _rx) = App::new(project);
+        // `start` would read the real self-update config, so open it directly.
+        app.open_workspace_picker(true);
+        assert!(app.workspace_picker().unwrap().startup);
+        assert!(!app.loading, "nothing is scanned before a member is chosen");
+        app.packages = vec![package()];
+        app.metadata.insert(0, MetadataStatus::Loading);
+
+        app.switch_workspace(1);
+        assert!(matches!(app.mode, Mode::Browse));
+        assert_eq!(app.project.name, "a");
+        assert_eq!(app.project.workspace.as_ref().unwrap().member, "packages/a");
+        assert!(app.packages.is_empty());
+        assert!(app.metadata.is_empty());
+        assert!(app.loading);
+
+        // Results started before the switch carry the old epoch.
+        let scan = |names: &[&str]| {
+            Ok(pm::ScanResult {
+                packages: names
+                    .iter()
+                    .map(|name| {
+                        let mut p = package();
+                        p.name = (*name).into();
+                        p
+                    })
+                    .collect(),
+                warning: None,
+            })
+        };
+        app.handle_message(Msg::Scan(0, scan(&["root-dep"])));
+        app.handle_message(Msg::PmVersion(0, "1.0.0".into()));
+        assert!(app.packages.is_empty());
+        assert!(app.loading);
+        assert_eq!(app.project.pm_version, "checking…");
+
+        app.handle_message(Msg::Scan(1, scan(&["member-dep"])));
+        assert!(!app.loading);
+        assert_eq!(app.packages[0].name, "member-dep");
+        app.handle_message(Msg::Metadata(0, 0, Err("old".into())));
+        assert!(matches!(
+            app.metadata.get(&0),
+            Some(MetadataStatus::Loading)
+        ));
+    }
+
+    #[tokio::test]
+    async fn updates_and_switches_wait_for_each_other() {
+        let dir = workspace_dir();
+        let project = ProjectInfo::load(dir.path(), None).unwrap();
+        let (mut app, _rx) = App::new(project);
+        app.packages = vec![package()];
+
+        // A scan is running, so the list may be stale: no update.
+        app.loading = true;
+        app.open_confirm(None);
+        app.start_update();
+        assert!(!app.updating);
+        assert!(app.confirm().is_none());
+
+        // An update is running, so the member cannot change under it.
+        app.loading = false;
+        app.updating = true;
+        app.open_workspace_picker(false);
+        app.switch_workspace(1);
+        assert_eq!(app.project.workspace.as_ref().unwrap().member, "");
+        assert!(app.status.contains("Wait for the update"));
     }
 
     #[test]
