@@ -92,9 +92,10 @@ versions, newest stable release, and the publication age of the latest tagged
 release. Registry lookups run in the background with at most four requests at
 once.
 
-Registry details are loaded asynchronously and cached for 12 hours under the
+Registry details, including weekly download counts, are loaded asynchronously
+and cached for 12 hours under the
 platform cache directory (`~/.cache/depee` on macOS). Network failures leave the
-package list usable.
+package list usable; a failed download count shows N/A and is retried next time.
 Run `depee --clear-cache` to remove registry metadata and update-check cache;
 they will be fetched again as needed.
 Updates are run as argument arrays through the detected package manager and
