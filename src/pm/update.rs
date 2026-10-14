@@ -93,7 +93,7 @@ pub async fn run_update(cwd: &Path, pm: Pm, request: &UpdateRequest) -> Result<S
     let name = &request.name;
     let requested = &request.requested_target;
     let effective = &request.effective_target;
-    Ok(match installed_version(cwd, name) {
+    let summary = match installed_version(cwd, name) {
         Some(installed) if request.upgrade && installed == *requested => format!(
             "{command} succeeded · installed {name}@{installed} · requested target reached"
         ),
@@ -109,7 +109,8 @@ pub async fn run_update(cwd: &Path, pm: Pm, request: &UpdateRequest) -> Result<S
         None => format!(
             "{command} succeeded · installed version could not be read from node_modules"
         ),
-    })
+    };
+    Ok(format!("✔ {summary}"))
 }
 
 /// Names come from the package manager's output; one starting with `-` would

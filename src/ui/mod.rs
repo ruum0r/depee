@@ -10,7 +10,7 @@ mod workspace;
 use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Style},
-    text::Line,
+    text::{Line, Span},
     widgets::{Block, Borders, Padding, Paragraph},
     Frame,
 };
@@ -147,10 +147,10 @@ fn footer_hints(app: &App) -> [Line<'static>; 2] {
             } else {
                 "↑/↓ or j/k select member · Enter switch · Esc cancel"
             }),
-            Line::from(format!(
-                "Scans and updates run in the chosen member. │ {}",
-                app.status
-            )),
+            Line::from(vec![
+                Span::raw("Scans and updates run in the chosen member. │ "),
+                status(app),
+            ]),
         ],
         Mode::Browse => {
             let workspace = if app.project.workspace.is_some() {
@@ -162,12 +162,25 @@ fn footer_hints(app: &App) -> [Line<'static>; 2] {
                 Line::from(
                     "↑↓ j/k Move · Enter Details · / Search · s Sort · v Versions · u Update",
                 ),
-                Line::from(format!(
-                    "S Reverse · c Changelog · r Refresh · {workspace}q Quit │ {}",
-                    app.status
-                )),
+                Line::from(vec![
+                    Span::raw(format!(
+                        "S Reverse · c Changelog · r Refresh · {workspace}q Quit │ "
+                    )),
+                    status(app),
+                ]),
             ]
         }
+    }
+}
+
+/// Update results start with `✔` (succeeded) or `✘` (failed); the color
+/// follows the mark.
+fn status(app: &App) -> Span<'static> {
+    let span = Span::raw(app.status.clone());
+    match app.status.chars().next() {
+        Some('✔') => span.style(Style::default().fg(Color::Green)),
+        Some('✘') => span.style(Style::default().fg(Color::Red)),
+        _ => span,
     }
 }
 
@@ -293,6 +306,17 @@ mod tests {
         let screen = render(&app, 120, 200);
         assert!(screen.contains("Command             npm update lib"));
         assert_eq!(app.confirm().unwrap().scroll_max.get(), 0);
+    }
+
+    #[test]
+    fn update_status_color_follows_its_mark() {
+        let mut app = loaded_app();
+        app.status = "✔ npm install lib@2.0.0 succeeded · requested target reached".into();
+        assert_eq!(status(&app).style.fg, Some(Color::Green));
+        app.status = "✘ Update failed · press e for error".into();
+        assert_eq!(status(&app).style.fg, Some(Color::Red));
+        app.status = "1 outdated".into();
+        assert_eq!(status(&app).style.fg, None);
     }
 
     #[test]
