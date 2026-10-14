@@ -60,7 +60,7 @@ impl App {
                         self.refresh();
                     }
                     Err(error) => {
-                        self.status = "Update failed · press e for error".into();
+                        self.status = "✘ Update failed · press e for error".into();
                         self.error = Some(error);
                     }
                 }
@@ -194,7 +194,7 @@ mod tests {
         assert_eq!(app.status, "npm update lib succeeded");
 
         app.handle_message(Msg::Update(0, Err("EACCES".into())));
-        assert_eq!(app.status, "Update failed · press e for error");
+        assert_eq!(app.status, "✘ Update failed · press e for error");
         assert_eq!(app.error.as_deref(), Some("EACCES"));
     }
 
